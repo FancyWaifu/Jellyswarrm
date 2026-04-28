@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderName, StatusCode},
+    http::{self, HeaderName, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
     Router,
@@ -15,7 +15,7 @@ use std::{net::SocketAddr, str::FromStr};
 use std::{sync::Arc, time::Duration};
 use tokio::task::AbortHandle;
 use tower::ServiceBuilder;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tower_sessions::cookie::Key;
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing::{debug, error, info, trace, warn};
@@ -367,10 +367,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ui_route = loaded_config.ui_route.to_string();
 
+    // Security headers applied to the management UI only — the bundled Jellyfin web
+    // client needs a more permissive policy and CORS is handled separately for the
+    // proxied API surface.
+    let security_headers = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-frame-options"),
+            http::HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-content-type-options"),
+            http::HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-xss-protection"),
+            http::HeaderValue::from_static("1; mode=block"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("referrer-policy"),
+            http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            http::HeaderValue::from_static(
+                "default-src 'self'; \
+                 script-src 'self'; \
+                 style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data: https:; \
+                 media-src 'self' https:; \
+                 connect-src 'self' wss: ws: https:; \
+                 frame-ancestors 'none'; \
+                 form-action 'self'; \
+                 base-uri 'self'",
+            ),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("permissions-policy"),
+            http::HeaderValue::from_static(
+                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()",
+            ),
+        ));
+
     let app = lowercase_routes! {
         Router::new()
             // UI Management routes
-            .nest(&format!("/{ui_route}"), ui_routes())
+            .nest(&format!("/{ui_route}"), ui_routes().layer(security_headers))
             .route("/", get(index_handler))
             .route(
                 "/QuickConnect/Enabled",
