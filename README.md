@@ -9,12 +9,14 @@
 <a href="https://www.gnu.org/licenses/old-licenses/gpl-2.0.html">
 <img alt="MIT License" src="https://img.shields.io/badge/License-GPL_v2-blue.svg"/>
 </a>
-<a href="https://github.com/LLukas22/Jellyswarrm/releases">
-<img alt="Current Release" src="https://img.shields.io/github/release/LLukas22/Jellyswarrm.svg"/>
+<a href="https://hub.docker.com/r/fivespeeddeasil/jellyswarrm">
+<img alt="Docker Image" src="https://img.shields.io/docker/pulls/fivespeeddeasil/jellyswarrm.svg"/>
 </a>
 </p>
 
 Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers into one place. If you’ve got libraries spread across different locations or just want everything together, Jellyswarrm makes it easy to access all your media from a single interface.
+
+> This is a friendly fork of [LLukas22/Jellyswarrm](https://github.com/LLukas22/Jellyswarrm) that tracks upstream and adds a thin layer of homelab-flavored hardening (SQLite WAL, per-IP auth rate limiting, validation, security headers). All upstream features are present unchanged.
 
 ---
 
@@ -33,7 +35,7 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 ## Features
 
 > [!WARNING]
-> Jellyswarrm is still in **early development**. It works, but some features are incomplete or missing. If you run into issues, please report them on the [GitHub Issues page](https://github.com/LLukas22/Jellyswarrm/issues).
+> Jellyswarrm is still in **early development**. It works, but some features are incomplete or missing. For fork-specific issues, open one on [this repo](https://github.com/FancyWaifu/Jellyswarrm/issues); for upstream behaviour, [LLukas22/Jellyswarrm](https://github.com/LLukas22/Jellyswarrm/issues) is the right place.
 
 ### ✅ Working
 
@@ -42,12 +44,21 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 * **User Mapping** – Link accounts across servers for a consistent user experience.
 * **API Compatibility** – Appears as a normal Jellyfin server, so existing apps and tools still work.
 * **Server Federation** – Automatically sync users across connected servers.
-* **User Page** – Personal dashboard for managing credentials and libraries. 
+* **User Page** – Personal dashboard for managing credentials and libraries.
+* **QuickConnect** – Sign in on one device by approving the code from another authenticated device.
+* **SyncPlay** – Watch together with your friends, with playback synced across all participants.
+* **Per-Server Streaming Mode** – Choose `Redirect` or `Proxy` independently for each backend.
+
+### 🛡️ Fork-Specific Hardening
+
+* **SQLite WAL + Tuning** – Concurrent reads, larger page cache, mmap I/O, performance indexes.
+* **Per-IP Auth Rate Limiter** – Caps login attempts (default: 5 / 10s) to blunt brute-force attacks.
+* **Credential Validation** – Username & password checks at the auth boundary before backend calls.
+* **Security Headers + CSP** – `frame-ancestors 'none'`, content-type sniff prevention, etc., on the management UI.
+* **In-Place Upgrade Safe** – Tolerates orphan migrations from older fork builds.
 
 ### ⚠️ In Progress
 
-* **QuickConnect** – Sign in on one device by approving the code from another authenticated device.
-* **Websocket Support** – Needed for real-time features like SyncPlay (not fully reliable yet).
 * **Audio Streaming** – May not function correctly (still untested in many cases).
 * **Automatic Bitrate Adjustment** – Stream quality based on network conditions isn’t supported yet.
 * **Media Management** – Features like adding or deleting media libraries through Jellyswarrm are not implemented yet.
@@ -56,13 +67,13 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 
 ## Deployment
 
-The easiest way to run Jellyswarrm is with the prebuilt [Docker images](https://github.com/LLukas22?tab=packages&repo_name=Jellyswarrm).
+The easiest way to run this fork is with the prebuilt [Docker image on Docker Hub](https://hub.docker.com/r/fivespeeddeasil/jellyswarrm) (`linux/amd64`).
 Here’s a minimal `docker-compose.yml` example to get started:
 
 ```yaml
 services:
   jellyswarrm:
-    image: ghcr.io/llukas22/jellyswarrm:latest
+    image: fivespeeddeasil/jellyswarrm:latest
     container_name: jellyswarrm
     restart: unless-stopped
     ports:
@@ -73,6 +84,8 @@ services:
       - JELLYSWARRM_USERNAME=admin
       - JELLYSWARRM_PASSWORD=jellyswarrm # ⚠️ Change this in production!
 ```
+
+> Prefer upstream's image? Use `ghcr.io/llukas22/jellyswarrm:latest` instead — you'll lose the fork-specific hardening but gain LLukas22's release cadence.
 
 Once the container is running, open:
 
@@ -92,7 +105,7 @@ For advanced configuration options, check out the [ui](./docs/ui.md) and [config
 To get started with development, you'll need to clone the repository along with its submodules. This ensures you have all the necessary components for a complete build:
 
 ```bash
-git clone --recurse-submodules https://github.com/LLukas22/Jellyswarrm.git
+git clone --recurse-submodules https://github.com/FancyWaifu/Jellyswarrm.git
 ```
 
 If you've already cloned the repository, you can initialize the submodules separately:
