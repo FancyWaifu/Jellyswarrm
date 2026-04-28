@@ -50,7 +50,7 @@ use server_storage::ServerStorageService;
 use user_authorization_service::UserAuthorizationService;
 
 use crate::{
-    config::{AppConfig, MIGRATOR},
+    config::AppConfig,
     handlers::quick_connect::{self, QuickConnectStorage},
     processors::{
         request_analyzer::RequestAnalyzer,
@@ -231,7 +231,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_with(options)
         .await?;
 
-    MIGRATOR.run(&pool).await.unwrap_or_else(|e| {
+    // Tolerate migrations applied by older fork builds that no longer exist in
+    // the source tree (e.g. the dropped admin/audit/api-key modules). Their
+    // tables remain in the DB unread; the binary only requires forward progress.
+    let mut migrator = sqlx::migrate!();
+    migrator.set_ignore_missing(true);
+    migrator.run(&pool).await.unwrap_or_else(|e| {
         error!("Failed to run database migrations: {}", e);
         std::process::exit(1);
     });

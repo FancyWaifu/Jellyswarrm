@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
-use sqlx::migrate::Migrator;
 use std::fmt;
 use std::fs;
 use std::ops::Deref;
@@ -42,8 +41,6 @@ impl fmt::Display for MediaStreamingMode {
         }
     }
 }
-
-pub static MIGRATOR: Migrator = sqlx::migrate!();
 
 pub static CLIENT_INFO: LazyLock<ClientInfo> = LazyLock::new(|| ClientInfo {
     client: "Jellyswarrm Proxy".to_string(),
