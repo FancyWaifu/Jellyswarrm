@@ -33,6 +33,7 @@ mod handlers;
 mod media_storage_service;
 mod models;
 mod processors;
+mod rate_limiter;
 mod request_preprocessing;
 mod server_storage;
 mod session_storage;
@@ -43,6 +44,7 @@ mod user_authorization_service;
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
 use media_storage_service::MediaStorageService;
+use rate_limiter::AuthRateLimiter;
 use server_storage::ServerStorageService;
 use user_authorization_service::UserAuthorizationService;
 
@@ -78,6 +80,7 @@ pub struct AppState {
     pub quick_connect: QuickConnectStorage,
     pub federated_users: Arc<FederatedUserService>,
     pub syncplay: Arc<SyncPlayService>,
+    pub auth_rate_limiter: Arc<AuthRateLimiter>,
 }
 
 impl AppState {
@@ -109,6 +112,7 @@ impl AppState {
             quick_connect,
             federated_users,
             syncplay: Arc::new(SyncPlayService::new()),
+            auth_rate_limiter: Arc::new(AuthRateLimiter::default_auth_limiter()),
         }
     }
 

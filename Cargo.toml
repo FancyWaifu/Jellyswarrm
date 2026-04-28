@@ -13,7 +13,10 @@ version = "0.2.1"
 aes-gcm = "0.10.3"
 anyhow = "1.0.100"
 
-# UI 
+# Rate limiting
+governor = "0.10.0"
+
+# UI
 askama = { version = "0.14.0" }
 async-recursion = "1.1.1"
 async-trait = "0.1.89"

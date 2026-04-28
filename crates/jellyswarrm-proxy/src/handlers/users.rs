@@ -9,6 +9,7 @@ use crate::{
     encryption::Password,
     handlers::common::execute_json_request,
     models::{AuthenticateRequest, AuthenticateResponse, Authorization, SyncPlayUserAccessType},
+    rate_limiter::extract_client_ip,
     request_preprocessing::preprocess_request,
     url_helper::join_server_url,
     AppState,
@@ -107,6 +108,11 @@ pub async fn handle_authenticate_by_name(
     headers: HeaderMap,
     Json(payload): Json<AuthenticateRequest>,
 ) -> Result<Json<AuthenticateResponse>, StatusCode> {
+    let client_ip = extract_client_ip(&headers);
+    if !state.auth_rate_limiter.check(client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     let mut servers = state
         .server_storage
         .list_servers()
