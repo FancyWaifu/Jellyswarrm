@@ -10,7 +10,7 @@ use axum::{
 use axum_messages::MessagesManagerLayer;
 use percent_encoding::percent_decode_str;
 use rust_embed::RustEmbed;
-use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
+use sqlx::sqlite::SqliteConnectOptions;
 use std::{net::SocketAddr, str::FromStr};
 use std::{sync::Arc, time::Duration};
 use tokio::task::AbortHandle;
@@ -208,9 +208,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve database path inside DATA_DIR
     let db_path = DATA_DIR.join("jellyswarrm.db");
     let db_url = format!("sqlite://{}", db_path.to_string_lossy());
-    let options = SqliteConnectOptions::from_str(&db_url)?.create_if_missing(true);
+    let options = SqliteConnectOptions::from_str(&db_url)?
+        .create_if_missing(true)
+        .busy_timeout(Duration::from_secs(5))
+        .optimize_on_close(true, None)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .pragma("cache_size", "-65536")
+        .pragma("mmap_size", "268435456")
+        .pragma("temp_store", "MEMORY")
+        .pragma("wal_autocheckpoint", "1000");
 
-    let pool = SqlitePool::connect_with(options).await?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(16)
+        .min_connections(2)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_with(options)
+        .await?;
 
     MIGRATOR.run(&pool).await.unwrap_or_else(|e| {
         error!("Failed to run database migrations: {}", e);
