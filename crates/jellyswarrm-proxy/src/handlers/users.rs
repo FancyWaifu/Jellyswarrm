@@ -12,6 +12,7 @@ use crate::{
     rate_limiter::extract_client_ip,
     request_preprocessing::preprocess_request,
     url_helper::join_server_url,
+    validation::{validate_password, validate_username},
     AppState,
 };
 
@@ -111,6 +112,15 @@ pub async fn handle_authenticate_by_name(
     let client_ip = extract_client_ip(&headers);
     if !state.auth_rate_limiter.check(client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    if let Err(e) = validate_username(&payload.username) {
+        warn!("Rejecting login: invalid username — {}", e);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Err(e) = validate_password(payload.password.as_str()) {
+        warn!("Rejecting login: invalid password — {}", e);
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let mut servers = state
