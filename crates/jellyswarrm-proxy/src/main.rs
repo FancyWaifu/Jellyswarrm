@@ -399,9 +399,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("content-security-policy"),
+            // The admin UI uses inline onclick handlers (e.g. dialog.showModal())
+            // and an inline theme-toggle script in base.html. 'unsafe-inline' is
+            // required for those to run. The UI is auth-gated, so the residual XSS
+            // surface is admin-only; all other CSP directives stay strict.
             http::HeaderValue::from_static(
                 "default-src 'self'; \
-                 script-src 'self'; \
+                 script-src 'self' 'unsafe-inline'; \
                  style-src 'self' 'unsafe-inline'; \
                  img-src 'self' data: https:; \
                  media-src 'self' https:; \
