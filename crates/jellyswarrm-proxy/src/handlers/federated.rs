@@ -6,9 +6,10 @@ use hyper::StatusCode;
 use regex::Regex;
 use std::sync::LazyLock;
 use tokio::task::JoinSet;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, info, trace};
 
 use crate::{
+    backend_health::DEFAULT_BACKEND_TIMEOUT,
     handlers::{
         common::{execute_json_request, process_media_item},
         items::get_items,
@@ -52,10 +53,28 @@ pub async fn get_items_from_all_servers(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Create JoinSet for parallel execution
+    // Filter out backends that are currently ejected from the federation
+    // fanout. Their content won't appear in this response; the revival probe
+    // will re-include them once they recover. This keeps a sick backend from
+    // dragging the whole dashboard's latency to its timeout ceiling.
+    let mut filtered_sessions = Vec::with_capacity(sessions.len());
+    for (session, server) in sessions {
+        if state.backend_health.is_ejected(server.id).await {
+            info!(
+                "Skipping ejected backend '{}' (id={}) on federated fanout",
+                server.name, server.id
+            );
+            continue;
+        }
+        filtered_sessions.push((session, server));
+    }
+    if filtered_sessions.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     let mut join_set = JoinSet::new();
 
-    for (index, (session, server)) in sessions.into_iter().enumerate() {
+    for (index, (session, server)) in filtered_sessions.into_iter().enumerate() {
         let request = match original_request.try_clone() {
             Some(req) => req,
             None => {
@@ -70,7 +89,6 @@ pub async fn get_items_from_all_servers(
         let server_clone = server.clone();
         let session_clone = session.clone();
 
-        // Spawn task in JoinSet with server index
         join_set.spawn(async move {
             apply_to_request(
                 &mut request,
@@ -81,13 +99,25 @@ pub async fn get_items_from_all_servers(
             )
             .await;
 
-            let result = match execute_json_request::<crate::models::ItemsResponseVariants>(
-                &state_clone.reqwest_client,
-                request,
-            )
-            .await
-            {
-                Ok(mut items_response) => {
+            let inner_call =
+                execute_json_request::<crate::models::ItemsResponseVariants>(
+                    &state_clone.reqwest_client,
+                    request,
+                );
+
+            let result = match tokio::time::timeout(DEFAULT_BACKEND_TIMEOUT, inner_call).await {
+                Err(_) => {
+                    error!(
+                        "Backend '{}' timed out after {:?} on federated call",
+                        server_clone.name, DEFAULT_BACKEND_TIMEOUT
+                    );
+                    state_clone
+                        .backend_health
+                        .record_failure(server_clone.id, &server_clone.name, "timeout")
+                        .await;
+                    return (index, None);
+                }
+                Ok(Ok(mut items_response)) => {
                     let server_id = { state_clone.config.read().await.server_id.clone() };
                     for item in items_response.iter_mut_items() {
                         match process_media_item(
@@ -120,13 +150,26 @@ pub async fn get_items_from_all_servers(
                         server_clone.name,
                         serde_json::to_string(&items_response).unwrap_or_default()
                     );
+                    state_clone
+                        .backend_health
+                        .record_success(server_clone.id, &server_clone.name)
+                        .await;
                     Some(items_response)
                 }
-                Err(e) => {
+                Ok(Err(status)) => {
                     error!(
-                        "Failed to get items from server '{}': {:?}",
-                        server_clone.name, e
+                        "Failed to get items from server '{}': status {}",
+                        server_clone.name, status
                     );
+                    // Only count network-class failures (BAD_GATEWAY) toward
+                    // ejection. 4xx-class returns from this helper indicate
+                    // user/auth errors and shouldn't penalize the backend.
+                    if status == StatusCode::BAD_GATEWAY {
+                        state_clone
+                            .backend_health
+                            .record_failure(server_clone.id, &server_clone.name, "network")
+                            .await;
+                    }
                     None
                 }
             };

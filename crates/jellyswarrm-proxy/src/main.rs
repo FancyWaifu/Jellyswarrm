@@ -26,6 +26,7 @@ use axum_login::{
     AuthManagerLayerBuilder,
 };
 
+mod backend_health;
 mod config;
 mod encryption;
 mod federated_users;
@@ -42,6 +43,7 @@ mod url_helper;
 mod user_authorization_service;
 mod validation;
 
+use backend_health::BackendHealth;
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
 use media_storage_service::MediaStorageService;
@@ -82,6 +84,7 @@ pub struct AppState {
     pub federated_users: Arc<FederatedUserService>,
     pub syncplay: Arc<SyncPlayService>,
     pub auth_rate_limiter: Arc<AuthRateLimiter>,
+    pub backend_health: BackendHealth,
 }
 
 impl AppState {
@@ -114,6 +117,7 @@ impl AppState {
             federated_users,
             syncplay: Arc::new(SyncPlayService::new()),
             auth_rate_limiter: Arc::new(AuthRateLimiter::default_auth_limiter()),
+            backend_health: BackendHealth::new(),
         }
     }
 
@@ -359,6 +363,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_store
             .clone()
             .continuously_delete_expired(tokio::time::Duration::from_secs(60)),
+    );
+
+    let revival_task = backend_health::spawn_revival_probe(
+        app_state.backend_health.clone(),
+        app_state.server_storage.clone(),
+        Duration::from_secs(10),
     );
 
     let key = Key::from(loaded_config.session_key.as_slice());
@@ -711,7 +721,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal(deletion_task.abort_handle()))
+        .with_graceful_shutdown(shutdown_signal(
+            deletion_task.abort_handle(),
+            revival_task.abort_handle(),
+        ))
         .await?;
 
     deletion_task.await??;
@@ -861,7 +874,10 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     )
 }
 
-async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
+async fn shutdown_signal(
+    deletion_task_abort_handle: AbortHandle,
+    revival_task_abort_handle: AbortHandle,
+) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -880,7 +896,13 @@ async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => { deletion_task_abort_handle.abort() },
-        _ = terminate => { deletion_task_abort_handle.abort() },
+        _ = ctrl_c => {
+            deletion_task_abort_handle.abort();
+            revival_task_abort_handle.abort();
+        },
+        _ = terminate => {
+            deletion_task_abort_handle.abort();
+            revival_task_abort_handle.abort();
+        },
     }
 }

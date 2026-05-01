@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
+#[cfg(test)]
+use sqlx::migrate::Migrator;
 use std::fmt;
 use std::fs;
 use std::ops::Deref;
@@ -41,6 +43,12 @@ impl fmt::Display for MediaStreamingMode {
         }
     }
 }
+
+/// Test-only Migrator handle. The runtime path constructs its own Migrator in
+/// `main()` so it can call `set_ignore_missing(true)` for in-place upgrades
+/// across older fork builds.
+#[cfg(test)]
+pub static MIGRATOR: Migrator = sqlx::migrate!();
 
 pub static CLIENT_INFO: LazyLock<ClientInfo> = LazyLock::new(|| ClientInfo {
     client: "Jellyswarrm Proxy".to_string(),
