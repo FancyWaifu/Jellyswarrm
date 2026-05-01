@@ -705,7 +705,10 @@ impl UserAuthorizationService {
     JOIN servers s ON RTRIM(auth.server_url, '/') = RTRIM(s.url, '/')
     WHERE auth.user_id = ?
     AND (auth.expires_at IS NULL OR auth.expires_at > ?)
-    ORDER BY s.priority DESC, s.name ASC
+    -- Tie-break by recency so a stale session row left behind by a prior
+    -- logout/relogin (Jellyfin web client regenerates device_id on every
+    -- fresh page load) cannot win selection over a freshly-stored one.
+    ORDER BY s.priority DESC, s.name ASC, auth.updated_at DESC, auth.id DESC
 "#,
         );
 
