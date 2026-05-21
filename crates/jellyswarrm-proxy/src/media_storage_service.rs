@@ -214,10 +214,24 @@ impl MediaStorageService {
                 created_at: row.get("media_created_at"),
             };
 
+            let server_url_raw: String = row.get("server_url_full");
+            let server_url = match url::Url::parse(&server_url_raw) {
+                Ok(url) => url,
+                Err(e) => {
+                    tracing::error!(
+                        "Media mapping {} skipped: invalid server url {:?}: {}",
+                        virtual_media_id,
+                        server_url_raw,
+                        e
+                    );
+                    return Ok(None);
+                }
+            };
+
             let server = Server {
                 id: row.get("server_id"),
                 name: row.get("server_name"),
-                url: url::Url::parse(row.get::<String, _>("server_url_full").as_str()).unwrap(),
+                url: server_url,
                 priority: row.get("priority"),
                 media_streaming_mode: row
                     .get::<String, _>("media_streaming_mode")

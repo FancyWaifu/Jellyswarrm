@@ -125,7 +125,7 @@ impl ServerStorageService {
         .await?;
 
         if let Some(row) = row {
-            Ok(Some(self.row_to_server(row)))
+            Ok(self.row_to_server(row))
         } else {
             Ok(None)
         }
@@ -144,7 +144,7 @@ impl ServerStorageService {
         .await?;
 
         if let Some(row) = row {
-            Ok(Some(self.row_to_server(row)))
+            Ok(self.row_to_server(row))
         } else {
             Ok(None)
         }
@@ -163,7 +163,7 @@ impl ServerStorageService {
 
         let servers = rows
             .into_iter()
-            .map(|row| self.row_to_server(row))
+            .filter_map(|row| self.row_to_server(row))
             .collect();
         Ok(servers)
     }
@@ -344,12 +344,29 @@ impl ServerStorageService {
         }
     }
 
-    /// Internal method to convert database row to Server struct
-    fn row_to_server(&self, row: sqlx::sqlite::SqliteRow) -> Server {
-        Server {
+    /// Internal method to convert a database row to a `Server`.
+    ///
+    /// Returns `None` (and logs) when the stored `url` does not parse, so a
+    /// single malformed row cannot panic the whole server-resolution path
+    /// (finding M-11).
+    fn row_to_server(&self, row: sqlx::sqlite::SqliteRow) -> Option<Server> {
+        let url_raw: String = row.get("url");
+        let url = match Url::parse(&url_raw) {
+            Ok(url) => url,
+            Err(e) => {
+                error!(
+                    "Skipping server row id={:?}: invalid url {:?}: {}",
+                    row.get::<i64, _>("id"),
+                    url_raw,
+                    e
+                );
+                return None;
+            }
+        };
+        Some(Server {
             id: row.get("id"),
             name: row.get("name"),
-            url: Url::parse(row.get("url")).unwrap(),
+            url,
             priority: row.get("priority"),
             media_streaming_mode: row
                 .get::<String, _>("media_streaming_mode")
@@ -357,7 +374,7 @@ impl ServerStorageService {
                 .unwrap_or(MediaStreamingMode::Redirect),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
-        }
+        })
     }
 
     pub async fn add_server_admin(
