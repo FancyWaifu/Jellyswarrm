@@ -113,10 +113,6 @@ impl FromRequestParts<AppState> for SessionContext {
     }
 }
 
-fn user_id_from_session_id(session_id: &str) -> Option<&str> {
-    session_id.split(':').next().filter(|s| !s.is_empty())
-}
-
 fn normalize_server_url(input: &str) -> &str {
     input.trim_end_matches('/')
 }
@@ -174,25 +170,62 @@ async fn users_have_library_access_to_items(
     Ok(true)
 }
 
-async fn group_has_library_access(
-    state: &AppState,
-    group: &SyncPlayGroup,
-    item_ids: &[String],
-) -> Result<bool, StatusCode> {
-    let user_ids = group
-        .participants
-        .keys()
-        .filter_map(|session_id| user_id_from_session_id(session_id).map(ToString::to_string))
-        .collect::<Vec<_>>();
-    users_have_library_access_to_items(state, &user_ids, item_ids).await
-}
-
 async fn user_has_library_access(
     state: &AppState,
     user_id: &str,
     item_ids: &[String],
 ) -> Result<bool, StatusCode> {
     users_have_library_access_to_items(state, &[user_id.to_string()], item_ids).await
+}
+
+/// The set of backend server URLs the given user currently has sessions on.
+async fn user_server_urls(
+    state: &AppState,
+    user_id: &str,
+) -> Result<HashSet<String>, StatusCode> {
+    let sessions = state
+        .user_authorization
+        .get_user_sessions_by_user_id(user_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(match sessions {
+        Some((_user, sessions)) => sessions
+            .into_iter()
+            .map(|(auth_session, _)| normalize_server_url(&auth_session.server_url).to_string())
+            .collect(),
+        None => HashSet::new(),
+    })
+}
+
+/// Decide whether a user may see or join a SyncPlay group.
+///
+/// For a non-empty queue the library-access check on the queued items is
+/// meaningful. For an EMPTY queue that check is vacuously true, so we fall
+/// back to requiring the user to share a backend with a current participant —
+/// otherwise any authenticated user could enumerate/join groups created by
+/// users on other backends (finding M-7).
+async fn user_can_access_group(
+    state: &AppState,
+    user_id: &str,
+    group: &SyncPlayGroup,
+) -> Result<bool, StatusCode> {
+    let item_ids = group.queue_item_ids();
+    if !item_ids.is_empty() {
+        return user_has_library_access(state, user_id, &item_ids).await;
+    }
+
+    let requester_servers = user_server_urls(state, user_id).await?;
+    if requester_servers.is_empty() {
+        return Ok(false);
+    }
+    for participant in group.participants.values() {
+        let participant_servers = user_server_urls(state, &participant.user_id).await?;
+        if !requester_servers.is_disjoint(&participant_servers) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn handle_ws(state: AppState, session: SessionContext, socket: WebSocket) {
@@ -278,7 +311,7 @@ pub async fn join_group(
         .get_group_snapshot_by_id(payload.group_id)
         .await
     {
-        if !user_has_library_access(&state, &session.user.id, &group.queue_item_ids()).await? {
+        if !user_can_access_group(&state, &session.user.id, &group).await? {
             deny_library_access(
                 &state,
                 &session,
@@ -312,7 +345,7 @@ pub async fn list_groups(
     let groups = state.syncplay.list_group_snapshots().await;
     let mut visible_groups = Vec::new();
     for group in groups {
-        if user_has_library_access(&state, &session.user.id, &group.queue_item_ids()).await? {
+        if user_can_access_group(&state, &session.user.id, &group).await? {
             visible_groups.push(group.to_group_info());
         }
     }
@@ -334,7 +367,7 @@ pub async fn get_group(
     let Some(group) = state.syncplay.get_group_snapshot_by_id(group_id).await else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    if !user_has_library_access(&state, &session.user.id, &group.queue_item_ids()).await? {
+    if !user_can_access_group(&state, &session.user.id, &group).await? {
         debug!(
             session_id = %session.session_id,
             user_id = %session.user.id,
@@ -351,12 +384,16 @@ pub async fn set_new_queue(
     session: SessionContext,
     Json(payload): Json<PlayRequestDto>,
 ) -> Result<StatusCode, StatusCode> {
-    if let Some(group) = state
+    if state
         .syncplay
         .get_group_snapshot_for_session(&session.session_id)
         .await
+        .is_some()
     {
-        if !group_has_library_access(&state, &group, &payload.playing_queue).await? {
+        // M-8: gate on the *requester's* library access, not every group
+        // member's. The previous AND-across-all-members check let a single
+        // cross-backend member permanently block all queue operations.
+        if !user_has_library_access(&state, &session.user.id, &payload.playing_queue).await? {
             deny_library_access(
                 &state,
                 &session,
@@ -561,12 +598,14 @@ pub async fn queue_items(
     session: SessionContext,
     Json(payload): Json<QueueRequestDto>,
 ) -> Result<StatusCode, StatusCode> {
-    if let Some(group) = state
+    if state
         .syncplay
         .get_group_snapshot_for_session(&session.session_id)
         .await
+        .is_some()
     {
-        if !group_has_library_access(&state, &group, &payload.item_ids).await? {
+        // M-8: gate on the requester's library access (see set_new_queue).
+        if !user_has_library_access(&state, &session.user.id, &payload.item_ids).await? {
             deny_library_access(
                 &state,
                 &session,

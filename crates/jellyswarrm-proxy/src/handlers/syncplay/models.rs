@@ -187,6 +187,7 @@ pub struct UtcTimeResponse {
 
 #[derive(Debug, Clone)]
 pub(super) struct GroupParticipant {
+    pub user_id: String,
     pub user_name: String,
     pub ping: u64,
     pub is_buffering: bool,

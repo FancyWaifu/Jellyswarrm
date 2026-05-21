@@ -244,6 +244,7 @@ impl SyncPlayService {
 
     fn make_participant(session: &SessionContext, is_buffering: bool) -> GroupParticipant {
         GroupParticipant {
+            user_id: session.user.id.clone(),
             user_name: session.user.original_username.clone(),
             ping: DEFAULT_PING_MS as u64,
             is_buffering,
