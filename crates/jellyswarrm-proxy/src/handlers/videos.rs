@@ -167,3 +167,35 @@ pub async fn get_stream(
         }
     }
 }
+
+/// Handles `GET /Items/{item_id}/Download`.
+///
+/// `preprocess_request` already resolves the backend server from the virtual
+/// item ID (`Items` is a media-id path tag) and rewrites the path to the
+/// original ID. We then either redirect the client to the origin server or
+/// stream the file through, honoring the per-server streaming mode. Range
+/// headers pass through untouched, so seeking/resumable downloads keep working.
+pub async fn get_download(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Response, StatusCode> {
+    let preprocessed = preprocess_request(req, &state).await.map_err(|e| {
+        error!("Failed to preprocess download request: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    let server = preprocessed.server;
+    let request = preprocessed.request;
+    let url = request.url().clone();
+
+    match server.media_streaming_mode {
+        MediaStreamingMode::Redirect => {
+            info!("Redirecting download to: {}", url);
+            Ok(axum::response::Redirect::temporary(url.as_ref()).into_response())
+        }
+        MediaStreamingMode::Proxy => {
+            info!("Proxying download from: {}", url);
+            proxy_request(&state.streaming_reqwest_client, request).await
+        }
+    }
+}

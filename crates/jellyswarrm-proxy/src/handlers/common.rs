@@ -244,9 +244,8 @@ pub async fn process_media_item(
         item.can_delete = Some(false);
     }
 
-    if item.can_download.is_some() {
-        item.can_download = Some(false);
-    }
+    // Leave `can_download` untouched: pass the upstream server's value through so
+    // clients show the download button and hit `/Items/{id}/Download` (proxied below).
 
     if let Some(media_sources) = &mut item.media_sources {
         for source in media_sources.iter_mut() {
