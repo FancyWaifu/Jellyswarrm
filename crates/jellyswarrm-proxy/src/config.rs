@@ -72,7 +72,14 @@ pub static CLIENT_STORAGE: LazyLock<jellyfin_api::storage::JellyfinClientStorage
 pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     let base = std::env::var("JELLYSWARRM_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap().join("data"));
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .map(|path| path.join("data"))
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to resolve current directory, using ./data: {e}");
+                    PathBuf::from("data")
+                })
+        });
     if let Err(e) = std::fs::create_dir_all(&base) {
         eprintln!("Failed to create data directory {base:?}: {e}");
     }
@@ -269,7 +276,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, DefaultFromSerde)]
+#[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]
 pub struct AppConfig {
     #[serde(default = "default_server_id")]
     pub server_id: String,
@@ -371,6 +378,47 @@ fn default_watched_sync_retry_interval_secs() -> u64 {
     60
 }
 
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let session_key = format!("<{} bytes>", self.session_key.len());
+        f.debug_struct("AppConfig")
+            .field("server_id", &self.server_id)
+            .field("public_address", &self.public_address)
+            .field("server_name", &self.server_name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "include_server_name_in_media",
+                &self.include_server_name_in_media,
+            )
+            .field("username", &self.username)
+            .field("password", &self.password)
+            // Names only: entries carry backend admin passwords.
+            .field(
+                "preconfigured_servers",
+                &self
+                    .preconfigured_servers
+                    .iter()
+                    .map(|s| &s.name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("session_key", &session_key)
+            .field("timeout", &self.timeout)
+            .field("ui_route", &self.ui_route)
+            .field("url_prefix", &self.url_prefix)
+            .field("media_streaming_mode", &self.media_streaming_mode)
+            .field(
+                "server_background_check_interval_secs",
+                &self.server_background_check_interval_secs,
+            )
+            .field(
+                "auto_create_users_on_login",
+                &self.auto_create_users_on_login,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 pub const DEFAULT_CONFIG_FILENAME: &str = "jellyswarrm.toml";
 
 fn config_path() -> PathBuf {
@@ -444,7 +492,7 @@ pub fn load_config_with_session_key(existing_key: Option<&[u8]>) -> anyhow::Resu
 
 /// Persist configuration to the first existing file or the primary default file.
 pub fn save_config(cfg: &AppConfig) -> std::io::Result<()> {
-    let toml_str = toml::to_string_pretty(cfg).expect("serialize config");
+    let toml_str = toml::to_string_pretty(cfg).map_err(std::io::Error::other)?;
     fs::write(config_path(), toml_str)?;
     info!("Configuration saved to {:?}", config_path());
     Ok(())
@@ -534,5 +582,33 @@ impl<'de> serde::Deserialize<'de> for UrlSegment {
         } else {
             Ok(UrlSegment(t))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_secrets() {
+        let mut cfg = AppConfig {
+            password: "master-secret".to_string().into(),
+            ..Default::default()
+        };
+        cfg.preconfigured_servers.push(
+            toml::from_str(
+                r#"url = "http://a"
+                   name = "A"
+                   priority = 1
+                   admin_username = "admin"
+                   admin_password = "backend-admin-secret""#,
+            )
+            .unwrap(),
+        );
+        let out = format!("{cfg:?}");
+        assert!(!out.contains("master-secret"), "{out}");
+        assert!(!out.contains("backend-admin-secret"), "{out}");
+        assert!(!out.contains(&format!("{:?}", cfg.session_key)), "{out}");
+        assert!(out.contains("\"A\""), "server names stay visible: {out}");
     }
 }

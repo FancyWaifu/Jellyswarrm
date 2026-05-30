@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -117,7 +117,7 @@ impl QuickConnectStorage {
     }
 
     pub fn store_session(&self, session: QuickConnectSession) {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store_lock();
         store
             .code_to_secret
             .insert(session.code.clone(), session.secret.clone());
@@ -127,7 +127,7 @@ impl QuickConnectStorage {
     /// Look up a session by its **secret** only. The 6-digit code is
     /// deliberately not accepted here — it is not a token-bearing credential.
     pub fn get_session_by_secret(&self, secret: &str) -> Option<QuickConnectSession> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store_lock();
 
         let (expired, code) = {
             let session = store.by_secret.get(secret)?;
@@ -150,7 +150,7 @@ impl QuickConnectStorage {
         code: &str,
         mut updater: impl FnMut(&mut QuickConnectSession),
     ) -> bool {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store_lock();
 
         let Some(secret) = store.code_to_secret.get(code).cloned() else {
             return false;
@@ -181,7 +181,7 @@ impl QuickConnectStorage {
 
     /// Remove a session by its **secret**, dropping the code index entry too.
     pub fn remove_session(&self, secret: &str) -> Option<QuickConnectSession> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store_lock();
 
         let session = store.by_secret.remove(secret)?;
         store.code_to_secret.remove(&session.code);
@@ -189,7 +189,7 @@ impl QuickConnectStorage {
     }
 
     pub fn cleanup_expired(&self) -> usize {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store_lock();
 
         let expired: Vec<(String, String)> = store
             .by_secret
@@ -219,6 +219,13 @@ impl QuickConnectStorage {
                 }
             }
         });
+    }
+
+    /// A panic while holding the lock must not take QuickConnect down for good.
+    fn store_lock(&self) -> MutexGuard<'_, QuickConnectStore> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

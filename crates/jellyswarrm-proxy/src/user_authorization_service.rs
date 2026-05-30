@@ -1069,7 +1069,9 @@ impl UserAuthorizationService {
                 continue;
             }
 
-            let canonical_session = stale_sessions.pop().unwrap();
+            let Some(canonical_session) = stale_sessions.pop() else {
+                continue;
+            };
 
             let updated = sqlx::query(
                 r#"
