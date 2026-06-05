@@ -1,0 +1,39 @@
+{% if providers.is_empty() %}
+<p>No SSO providers configured yet. Add one above.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Provider</th>
+            <th>Issuer</th>
+            <th>Login URL</th>
+            <th>Status</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for p in providers %}
+        <tr>
+            <td><strong>{{ p.display_name }}</strong><br><small class="muted">{{ p.slug }}</small></td>
+            <td><small>{{ p.issuer_url }}</small></td>
+            <td><small><code>/sso/login/{{ p.slug }}</code></small></td>
+            <td>
+                {% if p.enabled %}
+                <span class="badge badge-online"><i class="fas fa-circle-check"></i> Enabled</span>
+                {% else %}
+                <span class="badge badge-offline"><i class="fas fa-circle-xmark"></i> Disabled</span>
+                {% endif %}
+            </td>
+            <td>
+                <button class="secondary outline"
+                        hx-delete="/{{ ui_route }}/sso/providers/{{ p.id }}"
+                        hx-target="#provider-list" hx-swap="innerHTML"
+                        hx-confirm="Delete SSO provider &quot;{{ p.display_name }}&quot;? Users who signed in via it keep their accounts but can no longer log in through it.">
+                    <i class="fas fa-trash"></i> Delete
+                </button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}

@@ -132,6 +132,14 @@ pub fn ui_routes() -> axum::Router<AppState> {
             "/servers/{id}/admin",
             axum::routing::delete(admin::servers::delete_server_admin),
         )
+        // SSO / OIDC providers
+        .route("/sso", get(admin::sso::sso_page))
+        .route("/sso/providers", post(admin::sso::add_provider))
+        .route("/sso/providers/list", get(admin::sso::get_provider_list))
+        .route(
+            "/sso/providers/{id}",
+            axum::routing::delete(admin::sso::delete_provider),
+        )
         // Settings
         .route("/settings", get(admin::settings::settings_page))
         .route("/settings/form", get(admin::settings::settings_form))

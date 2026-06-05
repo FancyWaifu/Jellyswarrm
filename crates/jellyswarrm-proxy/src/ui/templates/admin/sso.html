@@ -1,0 +1,48 @@
+<div id="messages"></div>
+
+<header>
+    <h1>SSO / OIDC Providers</h1>
+    <h3>Register OpenID Connect identity providers for single sign-on.</h3>
+</header>
+
+<section id="add-provider" aria-labelledby="add-provider-heading">
+    <h2 id="add-provider-heading" class="section-heading-tight">Add Provider</h2>
+    <form hx-post="/{{ ui_route }}/sso/providers" hx-target="#provider-list" hx-swap="innerHTML" hx-disabled-elt="this" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div class="server-form-grid">
+            <label class="form-field"> <span class="field-label">Display name</span>
+                <input type="text" name="display_name" placeholder="Authentik" autocomplete="off" required>
+            </label>
+            <label class="form-field"> <span class="field-label">Slug
+                <span class="info-hint" tabindex="0"
+                      title="URL-safe id used in the login route /sso/login/&lt;slug&gt;. Re-adding an existing slug updates it."
+                      aria-label="Slug help">
+                    <i class="fas fa-circle-info" aria-hidden="true"></i>
+                </span>
+            </span>
+                <input type="text" name="slug" placeholder="authentik" pattern="[A-Za-z0-9_-]+" autocomplete="off" required>
+            </label>
+            <label class="form-field"> <span class="field-label">Issuer URL</span>
+                <input type="url" name="issuer_url" placeholder="https://auth.example.com/application/o/jellyswarrm/" inputmode="url" required>
+            </label>
+            <label class="form-field"> <span class="field-label">Client ID</span>
+                <input type="text" name="client_id" autocomplete="off" required>
+            </label>
+            <label class="form-field"> <span class="field-label">Client Secret</span>
+                <input type="password" name="client_secret" autocomplete="off" required>
+            </label>
+            <label class="form-field"> <span class="field-label">Scopes</span>
+                <input type="text" name="scopes" value="openid profile email" autocomplete="off">
+            </label>
+            <div class="server-form-submit">
+                <span class="field-label field-label-placeholder" aria-hidden="true">Add</span>
+                <button type="submit" class="server-form-button">Add Provider</button>
+            </div>
+        </div>
+    </form>
+</section>
+
+<hr />
+
+<section id="provider-list" hx-get="/{{ ui_route }}/sso/providers/list" hx-trigger="load">
+    <p>Loading providers...</p>
+</section>
