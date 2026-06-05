@@ -277,6 +277,20 @@ impl JellyfinClient {
             .await
     }
 
+    /// Admin: set (reset) a user's password. The calling client must hold an
+    /// admin token. Verified contract: `POST /Users/{id}/Password` with an empty
+    /// `CurrentPw` succeeds for an administrator changing another user.
+    pub async fn set_user_password(&self, user_id: &str, new_password: &str) -> Result<(), Error> {
+        let body = json!({
+            "CurrentPw": "",
+            "NewPw": new_password,
+            "ResetPassword": false
+        });
+        let path = format!("Users/{}/Password", user_id);
+        self.request_no_content(reqwest::Method::POST, &path, Some(&body))
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn get_items(
         &self,

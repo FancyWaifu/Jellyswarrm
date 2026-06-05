@@ -1,0 +1,57 @@
+# Dex — throwaway OIDC provider for local Jellyswarrm SSO testing.
+# NOT for production. See docs/sso.md §8.
+#
+# Issuer is "http://dex:5556/dex" so the value is identical whether resolved
+# from inside the docker network (service name "dex") or from your browser.
+# For the browser leg to work, add this line to your /etc/hosts:
+#     127.0.0.1 dex
+issuer: http://dex:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+# Auto-approve the consent screen so the redirect flow is one hop.
+oauth2:
+  skipApprovalScreen: true
+
+staticClients:
+  - id: jellyswarrm
+    name: Jellyswarrm
+    secret: jellyswarrm-dev-secret
+    redirectURIs:
+      - http://localhost:3000/sso/callback
+      - http://dex:3000/sso/callback
+      - http://localhost:8000/sso/callback
+
+enablePasswordDB: true
+
+# Test user — login with sso-test@example.com / password
+# userID becomes the stable OIDC `sub`.
+staticPasswords:
+  - email: sso-test@example.com
+    username: sso-test
+    userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+    # bcrypt hash of the literal string "password"
+    hash: "$2a$14$d4rnCXwR2qdlNIkazOKmzu0hRR03kAzB6pl7ScxulW2f7ARaU7hGS"
+  # Adversarial "attacker" identity: DIFFERENT subject, but email local-part
+  # collides with username "sso-test". Used to regression-test audit finding C1
+  # (auto-provision must NOT adopt the existing user's account/token).
+  - email: sso-test@evil.example
+    username: attacker
+    userID: "ffffffff-0000-0000-0000-000000000001"
+    hash: "$2a$14$d4rnCXwR2qdlNIkazOKmzu0hRR03kAzB6pl7ScxulW2f7ARaU7hGS"
+  # Collision demo: email local-part "user" matches the REAL backend "user"
+  # account. Tests whether SSO provisioning hijacks a pre-existing account.
+  - email: user@evil.example
+    username: collider
+    userID: "ffffffff-0000-0000-0000-000000000002"
+    hash: "$2a$14$d4rnCXwR2qdlNIkazOKmzu0hRR03kAzB6pl7ScxulW2f7ARaU7hGS"
+  # Non-colliding identity: "freshuser" exists on no backend — proves normal
+  # provisioning (create_user) still works after the G fix.
+  - email: freshuser@example.com
+    username: freshuser
+    userID: "ffffffff-0000-0000-0000-000000000003"
+    hash: "$2a$14$d4rnCXwR2qdlNIkazOKmzu0hRR03kAzB6pl7ScxulW2f7ARaU7hGS"

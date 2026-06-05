@@ -16,6 +16,9 @@ anyhow = "1.0.100"
 # Rate limiting
 governor = "0.10.0"
 
+# SSO / OIDC
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+
 # UI
 askama = { version = "0.14.0" }
 async-recursion = "1.1.1"

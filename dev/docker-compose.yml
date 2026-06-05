@@ -131,6 +131,37 @@ services:
       jellyfin-music:
         condition: service_started
 
+  dex:
+    image: ghcr.io/dexidp/dex:latest
+    container_name: jellyswarrm-dex
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./dex/config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      - "5556:5556"
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+
+  jellyswarrm:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: jellyswarrm-proxy:dev
+    container_name: jellyswarrm-proxy-dev
+    ports:
+      - "3000:3000"
+    environment:
+      - JELLYSWARRM_DATA_DIR=/app/data
+      - RUST_LOG=jellyswarrm_proxy=debug,jellyfin_api=info
+    volumes:
+      - ./jellyswarrm.toml:/app/data/jellyswarrm.toml:ro
+    depends_on:
+      - dex
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+
   caddy:
     image: caddy:latest
     container_name: jellyswarrm-caddy

@@ -298,6 +298,26 @@ pub async fn extract_request_infos(
             }
         }
 
+        // LAZY DEVICE SESSION (SSO / returning users): the bearer virtual_key is
+        // valid (user resolved) but this device has no session yet — e.g. a real
+        // Jellyfin client whose device_id differs from the one an SSO login was
+        // provisioned under. Establish sessions for this device from the user's
+        // stored mappings, then re-run strict lookup.
+        if sessions.is_empty() {
+            if let Some(device) = &device {
+                let created = state
+                    .federated_users
+                    .ensure_device_sessions(user, device)
+                    .await;
+                if created > 0 {
+                    sessions = state
+                        .user_authorization
+                        .get_user_sessions(&user.id, Some(device.clone()))
+                        .await?;
+                }
+            }
+        }
+
         // filter for online servers only
         let mut filtered_sessions: Vec<(AuthorizationSession, Server)> =
             Vec::with_capacity(sessions.len());

@@ -235,6 +235,34 @@ pub struct PreconfiguredServer {
     pub priority: i32,
     #[serde(default = "default_media_streaming_mode")]
     pub media_streaming_mode: MediaStreamingMode,
+    /// Optional admin credentials to seed `server_admins`. Required for SSO
+    /// provisioning (Jellyswarrm creates backend accounts via the admin API).
+    #[serde(default)]
+    pub admin_username: Option<String>,
+    #[serde(default)]
+    pub admin_password: Option<String>,
+}
+
+/// An OIDC identity provider seeded from config (until the Phase 3 admin UI).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PreconfiguredOidcProvider {
+    pub slug: String,
+    pub display_name: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_oidc_scopes() -> String {
+    "openid profile email".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, DefaultFromSerde)]
@@ -295,6 +323,22 @@ pub struct AppConfig {
         deserialize_with = "deserialize_auto_create_users_on_login"
     )]
     pub auto_create_users_on_login: bool,
+
+    /// OIDC providers to seed into the database at startup (until the Phase 3
+    /// admin UI). See docs/sso.md.
+    #[serde(default)]
+    pub preconfigured_oidc_providers: Vec<PreconfiguredOidcProvider>,
+
+    /// When true, an SSO login from an unknown `(issuer, subject)` auto-creates
+    /// a Jellyswarrm user and provisions it across all admin-available servers.
+    /// Default false — admins link identities explicitly (docs/sso.md §7).
+    #[serde(default)]
+    pub oidc_auto_provision: bool,
+
+    /// Set the `Secure` flag on session cookies. Enable in production (HTTPS,
+    /// e.g. behind Cloudflare); leave false for local HTTP dev. (Audit H3.)
+    #[serde(default)]
+    pub secure_cookies: bool,
 }
 
 pub const DEFAULT_CONFIG_FILENAME: &str = "jellyswarrm.toml";

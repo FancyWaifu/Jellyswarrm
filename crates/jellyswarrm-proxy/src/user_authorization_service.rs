@@ -426,16 +426,17 @@ impl UserAuthorizationService {
 
         let existing_mapping = self.get_server_mapping(user_id, server_url).await?;
 
+        // When a key is provided, NEVER silently downgrade to plaintext on an
+        // encryption error — a secret stored in the clear is worse than a failed
+        // mapping, so propagate the error. (Audit finding H1.) The `None` branch
+        // is an explicit keyless path used only by tests; production callers
+        // always supply the master/user key.
         let final_password = if let Some(master) = master_password {
-            match encrypt_password(mapped_password, master) {
-                Ok(encrypted) => encrypted,
-                Err(e) => {
-                    warn!("Failed to encrypt password: {}. Storing as plaintext.", e);
-                    EncryptedPassword::from_raw(mapped_password.as_str().into())
-                }
-            }
+            encrypt_password(mapped_password, master).map_err(|e| {
+                sqlx::Error::Protocol(format!("failed to encrypt server mapping password: {e}"))
+            })?
         } else {
-            warn!("No encryption password provided. Storing as plaintext!");
+            warn!("No encryption key provided for server mapping; storing plaintext (test path)");
             EncryptedPassword::from_raw(mapped_password.as_str().into())
         };
 

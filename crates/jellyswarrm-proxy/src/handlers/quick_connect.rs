@@ -731,6 +731,7 @@ mod tests {
         let data_context = DataContext {
             user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
             server_storage: Arc::new(ServerStorageService::new(pool.clone())),
+            oidc_storage: Arc::new(crate::oidc_storage::OidcStorageService::new(pool.clone())),
             media_storage: Arc::new(MediaStorageService::new(pool)),
             play_sessions: Arc::new(SessionStorage::new()),
             config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),

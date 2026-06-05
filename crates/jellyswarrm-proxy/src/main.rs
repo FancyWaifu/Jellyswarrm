@@ -33,6 +33,8 @@ mod federated_users;
 mod handlers;
 mod media_storage_service;
 mod models;
+mod oidc;
+mod oidc_storage;
 mod processors;
 mod rate_limiter;
 mod request_preprocessing;
@@ -48,6 +50,8 @@ use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
 use media_storage_service::MediaStorageService;
 use rate_limiter::AuthRateLimiter;
+use oidc::OidcService;
+use oidc_storage::OidcStorageService;
 use server_storage::ServerStorageService;
 use user_authorization_service::UserAuthorizationService;
 
@@ -76,6 +80,8 @@ pub struct AppState {
     pub streaming_reqwest_client: reqwest::Client,
     pub user_authorization: Arc<UserAuthorizationService>,
     pub server_storage: Arc<ServerStorageService>,
+    pub oidc_storage: Arc<OidcStorageService>,
+    pub oidc_service: OidcService,
     pub media_storage: Arc<MediaStorageService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
@@ -109,6 +115,8 @@ impl AppState {
             streaming_reqwest_client,
             user_authorization: data_context.user_authorization,
             server_storage: data_context.server_storage,
+            oidc_storage: data_context.oidc_storage,
+            oidc_service: OidcService::new(),
             media_storage: data_context.media_storage,
             play_sessions: data_context.play_sessions,
             config: data_context.config,
@@ -170,6 +178,7 @@ impl AppState {
 pub struct DataContext {
     pub user_authorization: Arc<UserAuthorizationService>,
     pub server_storage: Arc<ServerStorageService>,
+    pub oidc_storage: Arc<OidcStorageService>,
     pub media_storage: Arc<MediaStorageService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
@@ -283,6 +292,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize media storage service
     let media_storage = MediaStorageService::new(pool.clone());
 
+    // Initialize OIDC provider/identity storage
+    let oidc_storage = OidcStorageService::new(pool.clone());
+
     if !loaded_config.preconfigured_servers.is_empty() {
         info!(
             "Adding {} preconfigured servers from config",
@@ -333,9 +345,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Seed server admin credentials + OIDC providers from config (master-key
+    // encrypted). Lets the dev harness / deployments bootstrap SSO declaratively
+    // until the Phase 3 admin UI lands. See docs/sso.md.
+    {
+        let master_key: encryption::HashedPassword = loaded_config.password.clone().into();
+
+        // Admin creds for preconfigured servers (needed for SSO provisioning).
+        if let Ok(servers) = server_storage.list_servers().await {
+            for pre in &loaded_config.preconfigured_servers {
+                let (Some(admin_user), Some(admin_pass)) =
+                    (&pre.admin_username, &pre.admin_password)
+                else {
+                    continue;
+                };
+                let Some(server) = servers.iter().find(|s| {
+                    s.url.as_str().trim_end_matches('/') == pre.url.trim_end_matches('/')
+                }) else {
+                    continue;
+                };
+                match encryption::encrypt_password(&admin_pass.clone().into(), &master_key) {
+                    Ok(enc) => {
+                        if let Err(e) =
+                            server_storage.add_server_admin(server.id, admin_user, &enc).await
+                        {
+                            error!("Failed to seed admin creds for {}: {}", pre.name, e);
+                        } else {
+                            info!("  Seeded admin credentials for server {}", pre.name);
+                        }
+                    }
+                    Err(e) => error!("Failed to encrypt admin password for {}: {}", pre.name, e),
+                }
+            }
+        }
+
+        // OIDC providers.
+        for p in &loaded_config.preconfigured_oidc_providers {
+            match encryption::encrypt_password(&p.client_secret.clone().into(), &master_key) {
+                Ok(enc_secret) => {
+                    if let Err(e) = oidc_storage
+                        .upsert_provider(
+                            &p.slug,
+                            &p.display_name,
+                            &p.issuer_url,
+                            &p.client_id,
+                            &enc_secret,
+                            &p.scopes,
+                            p.enabled,
+                        )
+                        .await
+                    {
+                        error!("Failed to seed OIDC provider {}: {}", p.slug, e);
+                    } else {
+                        info!(
+                            "  Seeded OIDC provider '{}' ({})",
+                            p.display_name, p.issuer_url
+                        );
+                    }
+                }
+                Err(e) => error!("Failed to encrypt client secret for {}: {}", p.slug, e),
+            }
+        }
+        if loaded_config.oidc_auto_provision {
+            info!("OIDC auto-provision is ENABLED (unknown identities create users)");
+        }
+    }
+
     let data_context = DataContext {
         user_authorization: Arc::new(user_authorization.clone()),
         server_storage: Arc::new(server_storage.clone()),
+        oidc_storage: Arc::new(oidc_storage.clone()),
         media_storage: Arc::new(media_storage.clone()),
         play_sessions: Arc::new(SessionStorage::new()),
         config: Arc::new(tokio::sync::RwLock::new(loaded_config.clone())),
@@ -374,7 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = Key::from(loaded_config.session_key.as_slice());
 
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false)
+        .with_secure(loaded_config.secure_cookies)
         .with_same_site(tower_sessions::cookie::SameSite::Lax)
         .with_expiry(Expiry::OnInactivity(time::Duration::days(1))) // 24 hour
         .with_signed(key);
@@ -437,6 +516,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // UI Management routes
             .nest(&format!("/{ui_route}"), ui_routes().layer(security_headers))
             .route("/", get(index_handler))
+            .route(
+                "/sso/login/{slug}",
+                get(handlers::sso::handle_sso_login),
+            )
+            .route("/sso/callback", get(handlers::sso::handle_sso_callback))
             .route(
                 "/QuickConnect/Enabled",
                 get(handlers::quick_connect::handle_quick_connect_enabled),

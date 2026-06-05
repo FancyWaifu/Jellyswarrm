@@ -1,0 +1,61 @@
+# Dev Jellyswarrm config template for end-to-end SSO testing.
+# Copy to `jellyswarrm.toml` (gitignored) and fill in real secrets:
+#     cp jellyswarrm.toml.example jellyswarrm.toml
+# It is mounted into the dev container at /app/data/jellyswarrm.toml.
+#
+# `password` is the master key: it encrypts the seeded admin creds and OIDC
+# client secrets below. Keep it stable across runs or the DB can't decrypt them.
+
+username = "admin"
+password = "jellyswarrm"
+
+# Auto-create + provision a Jellyswarrm user on first SSO login from an unknown
+# identity (dev convenience; production default is false).
+oidc_auto_provision = true
+
+# Set the Secure flag on session cookies. Enable in production (HTTPS); leave
+# false for local HTTP dev.
+secure_cookies = false
+
+# The three dev Jellyfin backends, reachable by service name on jellyfin-dev-net.
+# admin_* seeds server_admins so SSO can provision accounts via the admin API.
+[[preconfigured_servers]]
+url = "http://jellyfin-movies:8096"
+name = "Movies"
+priority = 100
+admin_username = "admin"
+admin_password = "password"
+
+[[preconfigured_servers]]
+url = "http://jellyfin-tvshows:8096"
+name = "Shows"
+priority = 90
+admin_username = "admin"
+admin_password = "password"
+
+[[preconfigured_servers]]
+url = "http://jellyfin-music:8096"
+name = "Music"
+priority = 80
+admin_username = "admin"
+admin_password = "password"
+
+# Dex OIDC provider (see dev/dex/config.yaml) — self-contained dev IdP.
+[[preconfigured_oidc_providers]]
+slug = "dex"
+display_name = "Dex (dev)"
+issuer_url = "http://dex:5556/dex"
+client_id = "jellyswarrm"
+client_secret = "jellyswarrm-dev-secret"
+scopes = "openid profile email"
+enabled = true
+
+# Example: a real OIDC provider (e.g. Authentik). Fill in your own values.
+# [[preconfigured_oidc_providers]]
+# slug = "authentik"
+# display_name = "Authentik"
+# issuer_url = "https://auth.example.com/application/o/jellyswarrm/"
+# client_id = "CHANGEME-client-id"
+# client_secret = "CHANGEME-client-secret"
+# scopes = "openid profile email"
+# enabled = true

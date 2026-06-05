@@ -1,1 +1,4 @@
 .venv/
+# Local dev config holds real provider secrets — never commit it.
+# Copy jellyswarrm.toml.example to jellyswarrm.toml and fill in your values.
+jellyswarrm.toml
