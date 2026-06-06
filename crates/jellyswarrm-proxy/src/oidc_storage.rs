@@ -40,6 +40,17 @@ pub struct OidcIdentity {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// An identity row joined to its linked user's username, for admin display.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct OidcIdentityWithUser {
+    pub id: i64,
+    pub user_id: String,
+    pub issuer: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub username: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OidcStorageService {
     pool: SqlitePool,
@@ -156,6 +167,18 @@ impl OidcStorageService {
              WHERE user_id = ? ORDER BY created_at",
         )
         .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// All identities joined to their user's username (for the admin UI).
+    pub async fn list_identities(&self) -> Result<Vec<OidcIdentityWithUser>, sqlx::Error> {
+        sqlx::query_as::<_, OidcIdentityWithUser>(
+            "SELECT oi.id, oi.user_id, oi.issuer, oi.subject, oi.email, \
+             u.original_username AS username \
+             FROM oidc_identities oi LEFT JOIN users u ON u.id = oi.user_id \
+             ORDER BY oi.created_at DESC",
+        )
         .fetch_all(&self.pool)
         .await
     }

@@ -521,6 +521,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 get(handlers::sso::handle_sso_login),
             )
             .route("/sso/callback", get(handlers::sso::handle_sso_callback))
+            .route("/sso/link", post(handlers::sso::handle_sso_link))
+            .route("/sso/providers", get(handlers::sso::list_sso_providers))
+            .route("/sso/inject.js", get(handlers::sso::sso_inject_js))
             .route(
                 "/QuickConnect/Enabled",
                 get(handlers::quick_connect::handle_quick_connect_enabled),
@@ -838,9 +841,17 @@ async fn index_handler(
     } else {
         // Servers exist, return the index.html page
         if let Some(content) = Asset::get("index.html") {
+            // Inject the SSO login-button script into the served web client.
+            let html = String::from_utf8_lossy(&content.data);
+            let script = "<script src=\"/sso/inject.js\" defer></script>";
+            let injected = if html.contains("</body>") {
+                html.replacen("</body>", &format!("{script}</body>"), 1)
+            } else {
+                format!("{html}{script}")
+            };
             Ok(Response::builder()
                 .header("Content-Type", "text/html")
-                .body(Body::from(content.data.into_owned()))
+                .body(Body::from(injected))
                 .unwrap())
         } else {
             // Fallback if index.html is not found in assets

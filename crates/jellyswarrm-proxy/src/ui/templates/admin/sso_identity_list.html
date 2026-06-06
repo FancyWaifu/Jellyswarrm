@@ -1,0 +1,33 @@
+{% if identities.is_empty() %}
+<p>No SSO identities linked yet. Users can self-link at login, or add one above.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>User</th>
+            <th>Provider (issuer)</th>
+            <th>Subject</th>
+            <th>Email</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for i in identities %}
+        <tr>
+            <td><strong>{{ i.username.as_deref().unwrap_or("(missing user)") }}</strong></td>
+            <td><small>{{ i.issuer }}</small></td>
+            <td><small><code>{{ i.subject }}</code></small></td>
+            <td><small>{{ i.email.as_deref().unwrap_or("-") }}</small></td>
+            <td>
+                <button class="secondary outline"
+                        hx-delete="/{{ ui_route }}/sso/identities/{{ i.id }}"
+                        hx-target="#identity-list" hx-swap="innerHTML"
+                        hx-confirm="Unlink this SSO identity? The user can no longer sign in via it (their account stays).">
+                    <i class="fas fa-link-slash"></i> Unlink
+                </button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}

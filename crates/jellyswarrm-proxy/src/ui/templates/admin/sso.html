@@ -46,3 +46,40 @@
 <section id="provider-list" hx-get="/{{ ui_route }}/sso/providers/list" hx-trigger="load">
     <p>Loading providers...</p>
 </section>
+
+<hr />
+
+<header>
+    <h2 class="section-heading-tight">Linked Identities</h2>
+    <h3>Map an SSO identity to an existing Jellyswarrm user (so it inherits their backends). Users can also self-link at login.</h3>
+</header>
+
+<section id="add-identity" aria-labelledby="add-identity-heading">
+    <form hx-post="/{{ ui_route }}/sso/identities" hx-target="#identity-list" hx-swap="innerHTML" hx-disabled-elt="this" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div class="server-form-grid">
+            <label class="form-field"> <span class="field-label">Jellyswarrm user</span>
+                <input type="text" name="username" placeholder="username" autocomplete="off" required>
+            </label>
+            <label class="form-field"> <span class="field-label">Provider</span>
+                <input type="text" name="provider_slug" placeholder="authentik" autocomplete="off" required>
+            </label>
+            <label class="form-field"> <span class="field-label">Subject
+                <span class="info-hint" tabindex="0"
+                      title="The OIDC 'sub' claim for the user. They can read it off their link page when they attempt an SSO login."
+                      aria-label="Subject help">
+                    <i class="fas fa-circle-info" aria-hidden="true"></i>
+                </span>
+            </span>
+                <input type="text" name="subject" placeholder="sub claim" autocomplete="off" required>
+            </label>
+            <div class="server-form-submit">
+                <span class="field-label field-label-placeholder" aria-hidden="true">Link</span>
+                <button type="submit" class="server-form-button">Link Identity</button>
+            </div>
+        </div>
+    </form>
+</section>
+
+<section id="identity-list" hx-get="/{{ ui_route }}/sso/identities/list" hx-trigger="load">
+    <p>Loading identities...</p>
+</section>

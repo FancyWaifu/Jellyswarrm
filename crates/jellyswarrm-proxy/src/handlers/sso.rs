@@ -7,13 +7,14 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
+    Form, Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tower_sessions::Session;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::encryption::{decrypt_password, HashedPassword, Password};
 use crate::oidc::OidcLoginState;
@@ -198,29 +199,168 @@ pub async fn handle_sso_callback(
             .map_err(internal)?
             .ok_or_else(|| internal("identity references a missing user"))?;
         // Returning user: existing backend sessions (long-lived Jellyfin tokens)
-        // are reused. Re-establishing per-device sessions is Phase 3.
-        return Ok(success_page(&user.original_username, &user.virtual_key, &[]).into_response());
+        // are reused; new devices get a lazy session on first request.
+        let (sid, sname) = {
+            let c = state.config.read().await;
+            (c.server_id.clone(), c.server_name.clone())
+        };
+        return Ok(login_complete_page(&sid, &sname, &user.id, &user.virtual_key).into_response());
     }
 
-    // Unknown identity.
-    if !state.config.read().await.oidc_auto_provision {
-        warn!(
-            "SSO identity not linked and auto-provision disabled: ({}, {})",
-            claims.issuer, claims.subject
-        );
-        return Ok((
-            StatusCode::FORBIDDEN,
-            Html(unlinked_page(&claims.issuer, &claims.subject, claims.email.as_deref())),
+    // Unknown identity — offer to link an existing Jellyswarrm account (so the
+    // user inherits their backends) or, if enabled, create a new one. Stash the
+    // validated claims in the session for the /sso/link step.
+    let pending = PendingLink {
+        issuer: claims.issuer.clone(),
+        subject: claims.subject.clone(),
+        email: claims.email.clone(),
+    };
+    session.insert(PENDING_KEY, &pending).await.map_err(internal)?;
+    let auto = state.config.read().await.oidc_auto_provision;
+    Ok(Html(link_page(claims.email.as_deref(), auto)).into_response())
+}
+
+/// Validated identity awaiting an account link/create decision (session-stashed).
+#[derive(Serialize, Deserialize)]
+struct PendingLink {
+    issuer: String,
+    subject: String,
+    email: Option<String>,
+}
+const PENDING_KEY: &str = "oidc_pending";
+
+#[derive(Deserialize)]
+pub struct LinkForm {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub create: Option<String>,
+}
+
+/// `POST /sso/link` — complete an unlinked SSO login by either linking to an
+/// existing account (verify password + re-key its mappings to the master key)
+/// or creating a new one (auto-provision).
+pub async fn handle_sso_link(
+    State(state): State<AppState>,
+    session: Session,
+    Form(form): Form<LinkForm>,
+) -> Result<Response, HandlerError> {
+    let pending: PendingLink = session
+        .get(PENDING_KEY)
+        .await
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "no SSO login in progress (session expired?) — start again".to_string(),
+        ))?;
+
+    let (sid, sname) = {
+        let c = state.config.read().await;
+        (c.server_id.clone(), c.server_name.clone())
+    };
+
+    // Create-new branch (auto-provision).
+    if form.create.as_deref() == Some("1") {
+        if !state.config.read().await.oidc_auto_provision {
+            return Err((StatusCode::FORBIDDEN, "account creation is disabled".to_string()));
+        }
+        let user = provision_new_user(
+            &state,
+            &pending.issuer,
+            &pending.subject,
+            pending.email.as_deref(),
         )
-            .into_response());
+        .await?;
+        let _ = session.remove::<PendingLink>(PENDING_KEY).await;
+        return Ok(login_complete_page(&sid, &sname, &user.id, &user.virtual_key).into_response());
     }
 
-    // Auto-provision a BRAND-NEW user. We must NEVER adopt an existing username:
-    // get_or_create_user would return a pre-existing user's virtual_key, handing
-    // an attacker (whose IdP email local-part matches an existing username) that
-    // user's bearer token. So derive a candidate and force uniqueness with an
-    // identity-derived suffix before creating. (Audit finding C1.)
-    let base = derive_username(&claims.email, &claims.subject);
+    // Link-existing branch: prove ownership with username + password.
+    let username = form.username.unwrap_or_default();
+    let password_str = form.password.unwrap_or_default();
+    if username.trim().is_empty() || password_str.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "username and password are required".to_string(),
+        ));
+    }
+    let user = state
+        .user_authorization
+        .get_user_by_username(username.trim())
+        .await
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "invalid username or password".to_string(),
+        ))?;
+    if !user.original_password_hash.verify(&password_str) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid username or password".to_string(),
+        ));
+    }
+
+    // Re-key the user's backend mappings: decrypt with their password, re-encrypt
+    // under the master key so password-less SSO logins can use them.
+    let password: Password = password_str.as_str().into();
+    let user_key: HashedPassword = (&password).into();
+    let master_key: HashedPassword = {
+        let c = state.config.read().await;
+        c.password.clone().into()
+    };
+    let mappings = state
+        .user_authorization
+        .list_server_mappings(&user.id)
+        .await
+        .map_err(internal)?;
+    let mut rekeyed = 0;
+    for m in &mappings {
+        let plain = state.user_authorization.decrypt_server_mapping_password(
+            m,
+            &user_key,
+            &master_key,
+            Some(&password),
+            None,
+        );
+        match state
+            .user_authorization
+            .add_server_mapping(&user.id, &m.server_url, &m.mapped_username, &plain, Some(&master_key))
+            .await
+        {
+            Ok(_) => rekeyed += 1,
+            Err(e) => error!("re-key mapping failed for {}: {}", m.server_url, e),
+        }
+    }
+
+    state
+        .oidc_storage
+        .link_identity(&user.id, &pending.issuer, &pending.subject, pending.email.as_deref())
+        .await
+        .map_err(internal)?;
+    let _ = session.remove::<PendingLink>(PENDING_KEY).await;
+
+    info!(
+        "Linked SSO identity ({}, {}) -> user '{}' ({}); re-keyed {}/{} mappings",
+        pending.issuer,
+        pending.subject,
+        user.original_username,
+        user.id,
+        rekeyed,
+        mappings.len()
+    );
+
+    Ok(login_complete_page(&sid, &sname, &user.id, &user.virtual_key).into_response())
+}
+
+/// Auto-provision a BRAND-NEW user for an unlinked identity. Never adopts an
+/// existing username (audit C1): forces uniqueness with an identity-derived
+/// suffix before `create_user`.
+async fn provision_new_user(
+    state: &AppState,
+    issuer: &str,
+    subject: &str,
+    email: Option<&str>,
+) -> Result<crate::user_authorization_service::User, HandlerError> {
+    let base = derive_username(&email.map(|s| s.to_string()), subject);
     let mut username = base.clone();
     let mut attempt = 0u32;
     loop {
@@ -238,28 +378,25 @@ pub async fn handle_sso_callback(
             return Err(internal("could not allocate a unique username for SSO user"));
         }
         let mut h = Sha256::new();
-        h.update(claims.issuer.as_bytes());
+        h.update(issuer.as_bytes());
         h.update(b"|");
-        h.update(claims.subject.as_bytes());
+        h.update(subject.as_bytes());
         h.update(b"|");
         h.update(attempt.to_string().as_bytes());
         let suffix = hex::encode(h.finalize());
         username = format!("{base}-{}", &suffix[..8]);
     }
     let password: Password = crate::models::generate_token().into();
-
     let user = state
         .user_authorization
         .create_user(&username, &password)
         .await
         .map_err(internal)?;
-
     state
         .oidc_storage
-        .link_identity(&user.id, &claims.issuer, &claims.subject, claims.email.as_deref())
+        .link_identity(&user.id, issuer, subject, email)
         .await
         .map_err(internal)?;
-
     let results = state
         .federated_users
         .provision_sso_user(&username, &user.id, &password)
@@ -269,13 +406,81 @@ pub async fn handle_sso_callback(
         .filter(|r| matches!(r.status, crate::federated_users::SyncStatus::Created))
         .map(|r| r.server_name.clone())
         .collect();
-
     info!(
         "SSO auto-provisioned user '{}' ({}); mapped servers: {:?}",
         username, user.id, mapped
     );
+    Ok(user)
+}
 
-    Ok(success_page(&username, &user.virtual_key, &mapped).into_response())
+/// Enabled providers, for the login-screen picker. Public (names only, no secrets).
+#[derive(Serialize)]
+pub struct ProviderInfo {
+    pub slug: String,
+    pub display_name: String,
+}
+
+pub async fn list_sso_providers(State(state): State<AppState>) -> impl IntoResponse {
+    match state.oidc_storage.list_enabled_providers().await {
+        Ok(ps) => Json(
+            ps.into_iter()
+                .map(|p| ProviderInfo {
+                    slug: p.slug,
+                    display_name: p.display_name,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => {
+            error!("Failed to list SSO providers: {}", e);
+            Json(Vec::<ProviderInfo>::new()).into_response()
+        }
+    }
+}
+
+/// Injected into the served web client: adds a "Sign in with SSO" button to the
+/// login form and a provider picker.
+const INJECT_JS: &str = r#"(function(){
+  function get(cb){fetch('/sso/providers').then(function(r){return r.ok?r.json():[];}).then(cb).catch(function(){cb([]);});}
+  var providers=null;
+  function findForm(){
+    return document.querySelector('.manualLoginForm')
+      || document.querySelector('form.manualLoginForm')
+      || (function(){var p=document.querySelector('#txtManualPassword');return p?p.closest('form'):null;})()
+      || (function(){var p=document.querySelector('input[type=password]');return p?p.closest('form'):null;})();
+  }
+  function go(slug){window.location.href='/sso/login/'+encodeURIComponent(slug);}
+  function picker(){
+    if(document.getElementById('sso-picker'))return;
+    var ov=document.createElement('div');ov.id='sso-picker';
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:99999';
+    var box=document.createElement('div');
+    box.style.cssText='background:#202020;color:#fff;padding:1.5em;border-radius:8px;min-width:260px';
+    box.innerHTML='<h2 style="margin:0 0 .5em">Choose your sign-in server</h2>';
+    providers.forEach(function(p){var b=document.createElement('button');b.className='raised block emby-button';b.style.margin='.4em 0';b.textContent=p.display_name;b.onclick=function(){go(p.slug);};box.appendChild(b);});
+    var c=document.createElement('button');c.className='button-flat block emby-button';c.style.marginTop='.6em';c.textContent='Cancel';c.onclick=function(){ov.remove();};box.appendChild(c);
+    ov.appendChild(box);ov.onclick=function(e){if(e.target===ov)ov.remove();};document.body.appendChild(ov);
+  }
+  function ensure(){
+    if(!providers||!providers.length)return;
+    var form=findForm();if(!form)return;
+    if(document.getElementById('sso-login-btn'))return;
+    var btn=document.createElement('button');btn.id='sso-login-btn';btn.type='button';btn.className='raised block emby-button';btn.style.marginTop='1em';
+    btn.textContent='Sign in with SSO';
+    btn.onclick=function(e){e.preventDefault();if(providers.length===1){go(providers[0].slug);}else{picker();}};
+    form.appendChild(btn);
+  }
+  get(function(list){providers=list||[];if(!providers.length)return;ensure();new MutationObserver(ensure).observe(document.body,{childList:true,subtree:true});});
+})();"#;
+
+pub async fn sso_inject_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        INJECT_JS,
+    )
 }
 
 /// Derive a backend username from the email local-part (preferred) or subject,
@@ -308,40 +513,61 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-fn success_page(username: &str, virtual_key: &str, mapped: &[String]) -> Html<String> {
-    let servers = if mapped.is_empty() {
-        "<em>(existing sessions reused)</em>".to_string()
-    } else {
-        mapped
-            .iter()
-            .map(|s| format!("<li>{}</li>", esc(s)))
-            .collect::<String>()
-    };
+/// Completes login by writing the jellyfin-web credential store (so the served
+/// web client auto-connects) and redirecting into the app. Replaces the old
+/// token-display page.
+fn login_complete_page(server_id: &str, server_name: &str, user_id: &str, token: &str) -> Html<String> {
+    // serde_json escapes the values safely; replace `<` to prevent a `</script>`
+    // breakout from any free-text (server_name).
+    let creds = serde_json::json!({
+        "Servers": [{
+            "Id": server_id,
+            "Name": server_name,
+            "AccessToken": token,
+            "UserId": user_id,
+            "ManualAddress": "",
+            "DateLastAccessed": 0_i64,
+            "LastConnectionMode": 1
+        }]
+    });
+    let creds_json = serde_json::to_string(&creds)
+        .unwrap_or_else(|_| "{\"Servers\":[]}".to_string())
+        .replace('<', "\\u003c");
     Html(format!(
-        "<!doctype html><html><head><meta charset=utf-8><title>Jellyswarrm SSO</title></head>\
-         <body style=\"font-family:sans-serif;max-width:40rem;margin:3rem auto\">\
-         <h1>✅ Signed in as {username}</h1>\
-         <p>Your Jellyswarrm access token (virtual key):</p>\
-         <pre style=\"background:#eee;padding:1rem;border-radius:6px;word-break:break-all\">{virtual_key}</pre>\
-         <p>Mapped backends:</p><ul>{servers}</ul>\
-         <p style=\"color:#666\">Native clients: use QuickConnect and approve from here.</p>\
+        "<!doctype html><html><head><meta charset=utf-8><title>Signing in…</title></head>\
+         <body style=\"font-family:sans-serif;text-align:center;margin-top:4rem\">\
+         <p>Signing you in…</p>\
+         <script>(function(){{try{{var c={creds_json};c.Servers[0].ManualAddress=window.location.origin;c.Servers[0].DateLastAccessed=Date.now();localStorage.setItem('jellyfin_credentials',JSON.stringify(c));}}catch(e){{}}window.location.replace('/');}})();</script>\
+         <noscript><a href=\"/\">Continue to Jellyfin</a></noscript>\
          </body></html>",
-        username = esc(username),
-        virtual_key = esc(virtual_key)
+        creds_json = creds_json
     ))
 }
 
-fn unlinked_page(issuer: &str, subject: &str, email: Option<&str>) -> String {
+/// Shown to an unlinked SSO identity: link an existing account (username +
+/// password) or, if enabled, create a new one.
+fn link_page(email: Option<&str>, auto_provision: bool) -> String {
+    let create_section = if auto_provision {
+        "<hr style=\"margin:1.5rem 0\"><p style=\"color:#666\">Don't have a Jellyswarrm account yet?</p>\
+         <form method=post action=\"/sso/link\"><input type=hidden name=create value=1>\
+         <button type=submit style=\"width:100%\">Create a new account</button></form>"
+    } else {
+        ""
+    };
     format!(
-        "<!doctype html><html><head><meta charset=utf-8><title>Account not linked</title></head>\
-         <body style=\"font-family:sans-serif;max-width:40rem;margin:3rem auto\">\
-         <h1>Account not linked</h1>\
-         <p>Your identity was verified but isn't linked to a Jellyswarrm account yet. \
-         Ask your administrator to link it.</p>\
-         <pre style=\"background:#eee;padding:1rem;border-radius:6px\">issuer:  {issuer}\nsubject: {subject}\nemail:   {email}</pre>\
+        "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>Link your account</title></head>\
+         <body style=\"font-family:sans-serif;max-width:24rem;margin:3rem auto;padding:0 1rem\">\
+         <h1>Link your account</h1>\
+         <p>Signed in as <strong>{email}</strong> via SSO. Enter your existing Jellyswarrm \
+         username and password <em>once</em> to link this login to your account and its servers.</p>\
+         <form method=post action=\"/sso/link\">\
+         <p><label>Username<br><input name=username autocomplete=username required style=\"width:100%;padding:.5rem\"></label></p>\
+         <p><label>Password<br><input name=password type=password autocomplete=current-password required style=\"width:100%;padding:.5rem\"></label></p>\
+         <button type=submit style=\"width:100%;padding:.6rem\">Link &amp; sign in</button>\
+         </form>{create_section}\
          </body></html>",
-        issuer = esc(issuer),
-        subject = esc(subject),
-        email = esc(email.unwrap_or("(none)"))
+        email = esc(email.unwrap_or("your SSO account")),
+        create_section = create_section
     )
 }

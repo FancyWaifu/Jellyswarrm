@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::{
     encryption::{encrypt_password, Password},
-    oidc_storage::OidcProvider,
+    oidc_storage::{OidcIdentityWithUser, OidcProvider},
     AppState,
 };
 
@@ -158,6 +158,131 @@ pub async fn add_provider(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html("<div class=\"alert alert-error\">Failed to save provider.</div>"),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ----- linked identities -----
+
+#[derive(Template)]
+#[template(path = "admin/sso_identity_list.html")]
+pub struct SsoIdentityListTemplate {
+    pub identities: Vec<OidcIdentityWithUser>,
+    pub ui_route: String,
+}
+
+#[derive(Deserialize)]
+pub struct AddIdentityForm {
+    pub username: String,
+    pub provider_slug: String,
+    pub subject: String,
+}
+
+async fn render_identity_list(state: &AppState) -> Result<String, String> {
+    match state.oidc_storage.list_identities().await {
+        Ok(identities) => SsoIdentityListTemplate {
+            identities,
+            ui_route: state.get_ui_route().await,
+        }
+        .render()
+        .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub async fn get_identity_list(State(state): State<AppState>) -> impl IntoResponse {
+    match render_identity_list(&state).await {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => {
+            error!("Failed to render identity list: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response()
+        }
+    }
+}
+
+/// Admin: link an SSO identity `(provider issuer, subject)` to an existing user.
+pub async fn add_identity(
+    State(state): State<AppState>,
+    Form(form): Form<AddIdentityForm>,
+) -> Response {
+    let provider = match state
+        .oidc_storage
+        .get_provider_by_slug(form.provider_slug.trim())
+        .await
+    {
+        Ok(Some(p)) => p,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html("<div class=\"alert alert-error\">Unknown provider slug.</div>"),
+            )
+                .into_response()
+        }
+    };
+    let user = match state
+        .user_authorization
+        .get_user_by_username(form.username.trim())
+        .await
+    {
+        Ok(Some(u)) => u,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html("<div class=\"alert alert-error\">No such Jellyswarrm user.</div>"),
+            )
+                .into_response()
+        }
+    };
+    let subject = form.subject.trim();
+    if subject.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<div class=\"alert alert-error\">Subject is required.</div>"),
+        )
+            .into_response();
+    }
+    match state
+        .oidc_storage
+        .link_identity(&user.id, &provider.issuer_url, subject, None)
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Admin linked identity ({}, {}) -> user '{}'",
+                provider.issuer_url, subject, user.original_username
+            );
+            get_identity_list(State(state)).await.into_response()
+        }
+        Err(e) => {
+            error!("Failed to link identity: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<div class=\"alert alert-error\">Failed to link identity.</div>"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Admin: unlink an identity by id.
+pub async fn delete_identity(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match state.oidc_storage.unlink_identity(id).await {
+        Ok(true) => {
+            info!("Admin unlinked SSO identity id {}", id);
+            get_identity_list(State(state)).await.into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Html("<div class=\"alert alert-error\">Identity not found</div>"),
+        )
+            .into_response(),
+        Err(e) => {
+            error!("Failed to unlink identity: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<div class=\"alert alert-error\">Failed to unlink</div>"),
             )
                 .into_response()
         }
