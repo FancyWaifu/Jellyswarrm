@@ -49,8 +49,9 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 * **SyncPlay** – Watch together with your friends, with playback synced across all participants.
 * **Per-Server Streaming Mode** – Choose `Redirect` or `Proxy` independently for each backend.
 
-### 🛡️ Fork-Specific Hardening
+### 🛡️ Fork-Specific Additions
 
+* **Single Sign-On (OIDC)** – Bring your own identity provider. A "Sign in with SSO" button on the login screen lets users pick their provider and land logged in, with self-service & admin account linking. See [Single Sign-On (SSO)](#-single-sign-on-sso).
 * **SQLite WAL + Tuning** – Concurrent reads, larger page cache, mmap I/O, performance indexes.
 * **Per-IP Auth Rate Limiter** – Caps login attempts (default: 5 / 10s) to blunt brute-force attacks.
 * **Credential Validation** – Username & password checks at the auth boundary before backend calls.
@@ -96,6 +97,45 @@ Once the container is running, open:
 * **Bundled Jellyfin Web Client:** `http://[JELLYSWARRM_HOST]:[JELLYSWARRM_PORT]`
 
 For advanced configuration options, check out the [ui](./docs/ui.md) and [configuration](./docs/config.md) documentation.
+
+---
+
+## 🔑 Single Sign-On (SSO)
+
+Jellyswarrm can authenticate users against any standards-compliant **OpenID Connect (OIDC)** identity provider — bring your own. A **"Sign in with SSO"** button is added to the login screen; the user picks their provider and lands logged in.
+
+* **Bring your own IdP** – register providers in the management UI (**SSO** tab), or preconfigure them in your config file.
+* **Per-server providers** – optionally bind a provider to a specific backend, so the login picker *groups sign-in options by server*. Handy when every Jellyfin hoster runs their own IdP.
+* **Account linking** – users self-link their existing Jellyswarrm account once at first login (so they keep their servers), and admins can link identities too.
+* **Secure by construction** – Authorization Code flow with PKCE + nonce and full id_token validation (signature, issuer, audience, expiry). Identities are keyed on `(issuer, subject)`, never on email.
+
+### Verified providers
+
+Any spec-compliant OIDC server should work. These have been tested end-to-end:
+
+| Provider | Notes |
+|---|---|
+| **Authentik**, **Keycloak**, **Dex**, **Zitadel** | ✅ Works |
+| **Gitea**, **FusionAuth**, **Pocket ID**, **Ory Hydra** | ✅ Works |
+| **Casdoor** | ✅ Works (its non-standard claim shapes are tolerated) |
+| **Authelia**, **Kanidm** | ✅ Works over HTTPS (these require TLS) |
+
+### Configuration
+
+Add a provider from the **SSO** tab in the management UI, or preconfigure one:
+
+```toml
+[[preconfigured_oidc_providers]]
+slug = "authentik"
+display_name = "Authentik"
+issuer_url = "https://auth.example.com/application/o/jellyswarrm/"
+client_id = "your-client-id"
+client_secret = "your-client-secret"
+scopes = "openid profile email"
+# server = "Movies"   # optional: bind to one backend for the per-server picker
+```
+
+On the IdP side, set the application's **redirect URI** to `https://[JELLYSWARRM_HOST]/sso/callback`.
 
 ---
 
