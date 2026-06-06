@@ -1,0 +1,8 @@
+---
+users:
+  testuser:
+    disabled: false
+    displayname: 'Test User'
+    password: '$argon2id$v=19$m=65536,t=3,p=4$oi42IzQZ+ip9km8f+92BqA$e00LmgtE7nJV0XutFlDaNi56vGxGRNX6j7bhBTcjCMw'
+    email: 'testuser@example.com'
+    groups: ['users']

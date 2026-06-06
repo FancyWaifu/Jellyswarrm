@@ -1,0 +1,108 @@
+---
+# Authelia 4.39 minimal OIDC provider (IdP compatibility lab)
+theme: 'light'
+jwt_secret: '684fa793b24f58462a657e74f438baffe8fcf92c9eafe4993b0b700950e33cef'
+server:
+  address: 'tcp://0.0.0.0:9091/'
+log:
+  level: 'info'
+authentication_backend:
+  password_reset:
+    disable: true
+  file:
+    path: '/config/users_database.yml'
+    password:
+      algorithm: 'argon2'
+access_control:
+  default_policy: 'one_factor'
+session:
+  secret: '9a9a1bf836ab4d53cd7a01621335fa2045d1a2af32fac45e5ec5f1471f5a81ed'
+  cookies:
+    - name: 'authelia_session'
+      domain: 'localhost'
+      authelia_url: 'http://localhost:9091'
+      expiration: '1 hour'
+      inactivity: '5 minutes'
+regulation:
+  max_retries: 0
+storage:
+  encryption_key: 'f3c86b619edae2a184792bfed50c706d448158c2704609b0e5b3f03251e6b693'
+  local:
+    path: '/config/db.sqlite3'
+notifier:
+  disable_startup_check: true
+  filesystem:
+    filename: '/config/notification.txt'
+identity_providers:
+  oidc:
+    hmac_secret: 'aac701988f44d56228b1505f5228c78ade7a51af8eb06aae5806289278495ce0'
+    jwks:
+      - key_id: 'authelia'
+        algorithm: 'RS256'
+        use: 'sig'
+        certificate_chain: |
+          -----BEGIN CERTIFICATE-----
+          MIIDCzCCAfOgAwIBAgIQTyvuHfS8VkpHN0x3J4/axjANBgkqhkiG9w0BAQsFADAm
+          MREwDwYDVQQKEwhBdXRoZWxpYTERMA8GA1UEAxMIYXV0aGVsaWEwHhcNMjYwNjA2
+          MDQxMTQ3WhcNMjcwNjA2MDQxMTQ3WjAmMREwDwYDVQQKEwhBdXRoZWxpYTERMA8G
+          A1UEAxMIYXV0aGVsaWEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDY
+          MVQ1OO5jlgOK6fZNBIpUW0Wk4b7C7ddEE8lQKUxH7AkBM2JIAA2R1qd8NadAjAuM
+          5ZE+wvsMtKldnWVncpREzyjuZTdfZhPtq+yMjhTCOp0EKXsnH9iORKGv30k9uuUf
+          CF5fAxNuglLOl/pFveqqrbt5JAUhsfrvkWK0w+Hlxky7Y3yykTGmfnooP3SLyn6Q
+          n+bUNX6VMHmUoIU1lLmWrvB1tFkUveU7hlcfgdhGuznh6/YhylesQqroSy16gheK
+          scp4Peo9SX8sBSEQzy/e0lUbNShCfkKyI0cSv110e57ABPGWoKv6AM5fBIy36+xL
+          DHW/3k9elwhU6cMq9c3RAgMBAAGjNTAzMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUE
+          DDAKBggrBgEFBQcDATAMBgNVHRMBAf8EAjAAMA0GCSqGSIb3DQEBCwUAA4IBAQDX
+          XNsmAhhfggYvlXY+qua5fIHFs04JxSiPV9EiveCTF76yZwwTwY5A4yxObXz0A/hQ
+          smSDkjq0ZW37IPFGq8KYrhiF68oNaoKDmWJn7INYCanVz3K9EVp+rUoS/0F3/DRK
+          CtpKUQODakiHkqcBR/b2lSg79BQcWSect0jyfpmcLjIMbIe07uWdcAXfD4TnlLuT
+          Eas9OoJ71uNbMcBq70+kY9cuMSAivaNqV02+Zmkb9RA29BLPIekZzYHopTPlOp7l
+          vh4DCmSdOEj29lWgRyVY4U2xderJ5bQLaOu90BThovCUDApi3YFds9kXD1+fJhBc
+          PnRhyZdziVETBUdbqtAX
+          -----END CERTIFICATE-----
+        key: |
+          -----BEGIN PRIVATE KEY-----
+          MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDYMVQ1OO5jlgOK
+          6fZNBIpUW0Wk4b7C7ddEE8lQKUxH7AkBM2JIAA2R1qd8NadAjAuM5ZE+wvsMtKld
+          nWVncpREzyjuZTdfZhPtq+yMjhTCOp0EKXsnH9iORKGv30k9uuUfCF5fAxNuglLO
+          l/pFveqqrbt5JAUhsfrvkWK0w+Hlxky7Y3yykTGmfnooP3SLyn6Qn+bUNX6VMHmU
+          oIU1lLmWrvB1tFkUveU7hlcfgdhGuznh6/YhylesQqroSy16gheKscp4Peo9SX8s
+          BSEQzy/e0lUbNShCfkKyI0cSv110e57ABPGWoKv6AM5fBIy36+xLDHW/3k9elwhU
+          6cMq9c3RAgMBAAECggEAOF8QbnpESqpEjTW5N9bdvOY5sCb+xzQeI82m+eRy0/Qb
+          WvlLgKum3iai8FPLIx0BLAF2EG/l5ye6W8MdPE6Xk6OSsCqrOBBVVO011mZ7yjNf
+          WsT4LDj1Dg+eO04U+mgfsypK9SpHqFKKBf2B0CqXpF59mjZGskUGwe3eV3UWE4PZ
+          IAvZXXy5r5VoU+B6v3L5JDyX3HMOvdHzGci5AjVdmPEVbP5Aqek/bO/l8TpXXakZ
+          a6qQyXqzhQtdgaYEP0xkmqPkn2sXXdMNCCajOyjlqJRqUGhbJepcyGegN4IBVMrO
+          Akwto/ISq6hpMsEw5ycVGIarsI/3cBMPaRDN8GHzMwKBgQDzP/xaqSdUEhFF9ds4
+          u6aJGnUCF3oEEpTDI/DJVDatHjLwu3coRmQLCIdRxn9U1byZVN9JsLbzCJHaWj2U
+          ASmlhsp5tLgD4eVAK+o70uhQ6DlyjxZ8Sg6hmlc4xk15O9Oky7D+79UG0xhvvH8K
+          Pf44UV4zPMpiTpGp7NCeZoUohwKBgQDjhkeCfkrrh6Gs8/3j5D+5dc/eVRDw/Oqa
+          WP1K9LHNTozgeAVkZck8v3OeWFbDpjMYp+U2+9nUS569Ub1sc649+KkWsYFg++AB
+          QujYpV10WFLWDlSnhF8zJu/Esh3SStNsfSUkI4185wsNbcK75nFC0OJHDDexWS4O
+          lFGENRrk5wKBgGRd1WEPBHQy1D+6ls6M1sUhToAjcav2gr0VukdH4RuDJ1+e6iaL
+          DMJkrXj3XxiA7EWT+GGucX5L3epra5cC980dlbOr9nVborzcodQ3TLX9a56yHYQB
+          BpJ1XWHGqLbKEaSgixJVoN8lAKMx8nUmaRuRrz2S6qqvYnjrhpSlFnJHAoGAEfdN
+          eEFuuxB3tMeDedZRLdzesCi5cL4X7F4wihWuYI7eUu9HRbk/3bskbxF8sHBUQpMn
+          Z2MVvUzHWR22PnUYAi67c15K4BSjiJX2+vx7168Nw3dYOe4a8lgVwMtrzWo5Lazo
+          HOVty7oWxlWvddTphqQl6gRN9YQcPex6T10+JWsCgYBMnv0834p5kDy0eMRcYEv7
+          8xbO6/q/S45d8N/4LpKkHSkreTLceHNXSzbeLsfzu3Lve3mNUJR1nyr8SpSEgIcw
+          xyrfxI2IzEPEfHDB4LeL7bAp0G+QahXI9LWd38CTY27nl19KFTR6PYlVa8qxGyHH
+          ViLLpdzUMkyfqIbApE20yw==
+          -----END PRIVATE KEY-----
+    enable_client_debug_messages: true
+    clients:
+      - client_id: 'jellyswarrm'
+        client_name: 'Jellyswarrm'
+        client_secret: '$pbkdf2-sha512$310000$ot9SfGfPlPgDtxVJmD2iCg$VvxJFTvbWPQtqo4FhRKIFeIvhUz.Wz8yA/ThHYDDIxnuO6orVd5Ur8Su69XKyl0Qo96hNEm4JRvsg050cZPrbQ'
+        public: false
+        authorization_policy: 'one_factor'
+        consent_mode: 'implicit'
+        require_pkce: true
+        pkce_challenge_method: 'S256'
+        token_endpoint_auth_method: 'client_secret_post'
+        redirect_uris:
+          - 'http://localhost:3000/sso/callback'
+        scopes: ['openid', 'profile', 'email']
+        grant_types: ['authorization_code']
+        response_types: ['code']
+        response_modes: ['query']

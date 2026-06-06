@@ -143,6 +143,296 @@ services:
     networks:
       - jellyfin-dev-net
 
+  # --- IdP compatibility lab (test "bring your own SSO") ---
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: jellyswarrm-keycloak
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+      - KC_HEALTH_ENABLED=true
+    volumes:
+      - ./idp-lab/keycloak/realm-jellyswarrm.json:/opt/keycloak/data/import/realm-jellyswarrm.json:ro
+    ports:
+      - "8083:8080"
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+
+  authelia:
+    image: authelia/authelia:4.39
+    container_name: jellyswarrm-authelia
+    command: ["authelia", "--config=/config/configuration.yml"]
+    volumes:
+      - ./authelia:/config
+    ports:
+      - "9091:9091"
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+
+  casdoor:
+    image: casbin/casdoor-all-in-one:latest
+    container_name: jellyswarrm-casdoor
+    environment:
+      origin: "http://casdoor:8000"
+      originFrontend: "http://casdoor:8000"
+      runmode: "dev"
+    volumes:
+      - ./casdoor/init_data.json:/init_data.json:ro
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+
+  zitadel-db:
+    image: postgres:17-alpine
+    container_name: jellyswarrm-zitadel-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_pw
+      POSTGRES_DB: zitadel
+      PGUSER: postgres
+    volumes:
+      - zitadel-pgdata:/var/lib/postgresql/data
+    networks:
+      - jellyfin-dev-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d zitadel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v3.4.10
+    container_name: jellyswarrm-zitadel
+    command: 'start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode disabled'
+    environment:
+      ZITADEL_EXTERNALDOMAIN: zitadel
+      ZITADEL_EXTERNALPORT: "8080"
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel_pw
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres_pw
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: "zitadel-admin"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: "Password1!"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      ZITADEL_FIRSTINSTANCE_PATPATH: /machinekey/zitadel-admin-sa.pat
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: "zitadel-admin-sa"
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: "Admin Service Account"
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_SCOPES: "openid urn:zitadel:iam:org:project:id:zitadel:aud"
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2030-01-01T00:00:00Z"
+    ports:
+      - "8084:8080"
+    volumes:
+      - zitadel-machinekey:/machinekey
+    depends_on:
+      zitadel-db:
+        condition: service_healthy
+    networks:
+      - jellyfin-dev-net
+
+  # IdP lab wave 2 — Gitea (app-as-IdP), FusionAuth (dedicated), Pocket ID
+  # (passkey), Ory Hydra (headless OAuth2 server). All plain-HTTP, RS256.
+  gitea:
+    image: gitea/gitea:1.24
+    container_name: jellyswarrm-gitea
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__database__DB_TYPE: "sqlite3"
+      GITEA__database__PATH: "/data/gitea/gitea.db"
+      GITEA__server__PROTOCOL: "http"
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__DOMAIN: "gitea"
+      GITEA__server__ROOT_URL: "http://gitea:3000/"
+      GITEA__oauth2__ENABLED: "true"
+      GITEA__oauth2__JWT_SIGNING_ALGORITHM: "RS256"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__mailer__ENABLED: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - gitea-data:/data
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+
+  fusionauth-db:
+    image: postgres:16-alpine
+    container_name: jellyswarrm-fusionauth-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - fa-db-data:/var/lib/postgresql/data
+    networks:
+      - jellyfin-dev-net
+
+  fusionauth:
+    image: fusionauth/fusionauth-app:latest
+    container_name: jellyswarrm-fusionauth
+    depends_on:
+      fusionauth-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: jdbc:postgresql://fusionauth-db:5432/fusionauth
+      DATABASE_ROOT_USERNAME: postgres
+      DATABASE_ROOT_PASSWORD: postgres
+      DATABASE_USERNAME: fusionauth
+      DATABASE_PASSWORD: fusionauth
+      SEARCH_TYPE: database
+      FUSIONAUTH_APP_MEMORY: 512M
+      FUSIONAUTH_APP_RUNTIME_MODE: development
+      FUSIONAUTH_APP_SILENT_MODE: "true"
+      FUSIONAUTH_APP_URL: http://fusionauth:9011
+      FUSIONAUTH_APP_KICKSTART_FILE: /usr/local/fusionauth/kickstart/kickstart.json
+    ports:
+      - "9011:9011"
+    volumes:
+      - fa-config:/usr/local/fusionauth/config
+      - ./idp-lab/fusionauth:/usr/local/fusionauth/kickstart:ro
+    networks:
+      - jellyfin-dev-net
+
+  pocketid:
+    image: ghcr.io/pocket-id/pocket-id:v2
+    container_name: jellyswarrm-pocketid
+    environment:
+      # APP_URL host doubles as the WebAuthn RPID, which must be a real dotted
+      # domain — "pocketid" alone is rejected. Use the pocketid.local alias.
+      APP_URL: "http://pocketid.local:1411"
+      TRUST_PROXY: "false"
+      ENCRYPTION_KEY: "dev-lab-pocketid-encryption-key-0123456789"
+      STATIC_API_KEY: "dev-lab-pocketid-static-api-key-0123456789abcdef"
+      ANALYTICS_DISABLED: "true"
+      VERSION_CHECK_DISABLED: "true"
+      DISABLE_RATE_LIMITING: "true"
+    ports:
+      - "1411:1411"
+    volumes:
+      - pocketid-data:/app/data
+    restart: unless-stopped
+    networks:
+      jellyfin-dev-net:
+        aliases:
+          - pocketid.local
+
+  hydra-db:
+    image: postgres:16-alpine
+    container_name: jellyswarrm-hydra-db
+    environment:
+      POSTGRES_USER: hydra
+      POSTGRES_PASSWORD: hydra_pw
+      POSTGRES_DB: hydra
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hydra"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - hydra-pgdata:/var/lib/postgresql/data
+    networks:
+      - jellyfin-dev-net
+
+  hydra-migrate:
+    image: oryd/hydra:v2.2.0
+    container_name: jellyswarrm-hydra-migrate
+    command: migrate sql -e --yes
+    environment:
+      DSN: postgres://hydra:hydra_pw@hydra-db:5432/hydra?sslmode=disable
+    depends_on:
+      hydra-db:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - jellyfin-dev-net
+
+  hydra:
+    image: oryd/hydra:v2.2.0
+    container_name: jellyswarrm-hydra
+    command: serve all --dev
+    environment:
+      DSN: postgres://hydra:hydra_pw@hydra-db:5432/hydra?sslmode=disable
+      URLS_SELF_ISSUER: http://hydra:4444
+      URLS_LOGIN: http://hydra-consent:3000/login
+      URLS_CONSENT: http://hydra-consent:3000/consent
+      SECRETS_SYSTEM: dev-lab-hydra-system-secret-32bytes!!
+      LOG_LEVEL: info
+    ports:
+      - "4444:4444"
+      - "4445:4445"
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+
+  hydra-consent:
+    image: python:3.12-alpine
+    container_name: jellyswarrm-hydra-consent
+    working_dir: /app
+    command:
+      - sh
+      - -c
+      - |
+        pip install --quiet --no-cache-dir flask requests &&
+        cat > /app/app.py <<'PYEOF'
+        import os, requests
+        from flask import Flask, request, redirect
+        ADMIN = os.environ.get("HYDRA_ADMIN_URL", "http://hydra:4445")
+        SUBJECT = os.environ.get("TEST_SUBJECT", "testuser")
+        EMAIL = os.environ.get("TEST_EMAIL", "testuser@example.com")
+        app = Flask(__name__)
+        @app.get("/login")
+        def login():
+            ch = request.args["login_challenge"]
+            r = requests.put(f"{ADMIN}/admin/oauth2/auth/requests/login/accept",
+                params={"login_challenge": ch},
+                json={"subject": SUBJECT, "remember": True, "remember_for": 3600})
+            return redirect(r.json()["redirect_to"])
+        @app.get("/consent")
+        def consent():
+            ch = request.args["consent_challenge"]
+            cr = requests.get(f"{ADMIN}/admin/oauth2/auth/requests/consent",
+                params={"consent_challenge": ch}).json()
+            r = requests.put(f"{ADMIN}/admin/oauth2/auth/requests/consent/accept",
+                params={"consent_challenge": ch},
+                json={"grant_scope": cr.get("requested_scope", []) or [],
+                      "grant_access_token_audience": cr.get("requested_access_token_audience", []) or [],
+                      "remember": True, "remember_for": 3600,
+                      "session": {"id_token": {"email": EMAIL, "email_verified": True, "name": SUBJECT}}})
+            return redirect(r.json()["redirect_to"])
+        @app.get("/healthz")
+        def healthz():
+            return "ok"
+        app.run(host="0.0.0.0", port=3000)
+        PYEOF
+        python /app/app.py
+    environment:
+      HYDRA_ADMIN_URL: http://hydra:4445
+      TEST_SUBJECT: testuser
+      TEST_EMAIL: testuser@example.com
+    networks:
+      - jellyfin-dev-net
+
   jellyswarrm:
     build:
       context: ..
@@ -175,6 +465,15 @@ services:
       - jellyfin-movies
       - jellyfin-tvshows
       - jellyfin-music
+
+volumes:
+  zitadel-pgdata:
+  zitadel-machinekey:
+  gitea-data:
+  fa-db-data:
+  fa-config:
+  pocketid-data:
+  hydra-pgdata:
 
 networks:
   jellyfin-dev-net:

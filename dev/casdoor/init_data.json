@@ -1,0 +1,13 @@
+{
+  "applications": [
+    {
+      "owner": "admin", "name": "jellyswarrm", "displayName": "Jellyswarrm",
+      "organization": "built-in", "cert": "cert-built-in",
+      "enablePassword": true, "enableSignUp": false,
+      "clientId": "jellyswarrm-client-id", "clientSecret": "jellyswarrm-client-secret",
+      "redirectUris": ["http://localhost:3000/sso/callback"],
+      "grantTypes": ["authorization_code"], "tokenFormat": "JWT", "expireInHours": 168,
+      "signinMethods": [{ "name": "Password", "displayName": "Password", "rule": "All" }]
+    }
+  ]
+}
