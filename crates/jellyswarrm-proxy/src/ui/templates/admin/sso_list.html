@@ -5,6 +5,7 @@
     <thead>
         <tr>
             <th>Provider</th>
+            <th>Server</th>
             <th>Issuer</th>
             <th>Login URL</th>
             <th>Status</th>
@@ -15,6 +16,12 @@
         {% for p in providers %}
         <tr>
             <td><strong>{{ p.display_name }}</strong><br><small class="muted">{{ p.slug }}</small></td>
+            <td>
+                {% match p.server_name %}
+                {% when Some with (name) %}<small>{{ name }}</small>
+                {% when None %}<small class="muted">All servers</small>
+                {% endmatch %}
+            </td>
             <td><small>{{ p.issuer_url }}</small></td>
             <td><small><code>/sso/login/{{ p.slug }}</code></small></td>
             <td>

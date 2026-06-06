@@ -51,6 +51,10 @@ scopes = "openid profile email"
 enabled = true
 
 # Example: a real OIDC provider (e.g. Authentik). Fill in your own values.
+# `server` (optional) binds this provider to one preconfigured_servers entry by
+# name, so the login picker groups it under that backend — useful when each
+# Jellyfin hoster brings their own SSO. Omit it to offer the provider for all
+# servers.
 # [[preconfigured_oidc_providers]]
 # slug = "authentik"
 # display_name = "Authentik"
@@ -59,3 +63,4 @@ enabled = true
 # client_secret = "CHANGEME-client-secret"
 # scopes = "openid profile email"
 # enabled = true
+# server = "Movies"   # optional: bind to a specific backend

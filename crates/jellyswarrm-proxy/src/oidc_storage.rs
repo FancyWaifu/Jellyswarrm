@@ -24,8 +24,24 @@ pub struct OidcProvider {
     /// Space-separated scope list, e.g. "openid profile email".
     pub scopes: String,
     pub enabled: bool,
+    /// Federated backend this provider signs into; `None` = available for all
+    /// servers. Drives the per-server grouping in the login picker.
+    pub server_id: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A provider joined to its bound server's name, for the login picker and the
+/// admin list. `server_name` is `None` for providers available to all servers.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct OidcProviderRow {
+    pub id: i64,
+    pub slug: String,
+    pub display_name: String,
+    pub issuer_url: String,
+    pub enabled: bool,
+    pub server_id: Option<i64>,
+    pub server_name: Option<String>,
 }
 
 /// A link from an external identity `(issuer, subject)` to a local Jellyswarrm user.
@@ -66,7 +82,7 @@ impl OidcStorageService {
     pub async fn list_providers(&self) -> Result<Vec<OidcProvider>, sqlx::Error> {
         sqlx::query_as::<_, OidcProvider>(
             "SELECT id, slug, display_name, issuer_url, client_id, client_secret, scopes, \
-             enabled, created_at, updated_at FROM oidc_providers ORDER BY display_name",
+             enabled, server_id, created_at, updated_at FROM oidc_providers ORDER BY display_name",
         )
         .fetch_all(&self.pool)
         .await
@@ -76,7 +92,7 @@ impl OidcStorageService {
     pub async fn list_enabled_providers(&self) -> Result<Vec<OidcProvider>, sqlx::Error> {
         sqlx::query_as::<_, OidcProvider>(
             "SELECT id, slug, display_name, issuer_url, client_id, client_secret, scopes, \
-             enabled, created_at, updated_at FROM oidc_providers WHERE enabled = 1 \
+             enabled, server_id, created_at, updated_at FROM oidc_providers WHERE enabled = 1 \
              ORDER BY display_name",
         )
         .fetch_all(&self.pool)
@@ -89,7 +105,7 @@ impl OidcStorageService {
     ) -> Result<Option<OidcProvider>, sqlx::Error> {
         sqlx::query_as::<_, OidcProvider>(
             "SELECT id, slug, display_name, issuer_url, client_id, client_secret, scopes, \
-             enabled, created_at, updated_at FROM oidc_providers WHERE slug = ?",
+             enabled, server_id, created_at, updated_at FROM oidc_providers WHERE slug = ?",
         )
         .bind(slug)
         .fetch_optional(&self.pool)
@@ -97,6 +113,7 @@ impl OidcStorageService {
     }
 
     /// Insert or replace a provider by `slug`. `client_secret` must already be encrypted.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_provider(
         &self,
         slug: &str,
@@ -106,11 +123,12 @@ impl OidcStorageService {
         client_secret: &EncryptedPassword,
         scopes: &str,
         enabled: bool,
+        server_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO oidc_providers \
-             (slug, display_name, issuer_url, client_id, client_secret, scopes, enabled, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+             (slug, display_name, issuer_url, client_id, client_secret, scopes, enabled, server_id, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
              ON CONFLICT(slug) DO UPDATE SET \
                display_name = excluded.display_name, \
                issuer_url   = excluded.issuer_url, \
@@ -118,6 +136,7 @@ impl OidcStorageService {
                client_secret= excluded.client_secret, \
                scopes       = excluded.scopes, \
                enabled      = excluded.enabled, \
+               server_id    = excluded.server_id, \
                updated_at   = CURRENT_TIMESTAMP",
         )
         .bind(slug)
@@ -127,9 +146,38 @@ impl OidcStorageService {
         .bind(client_secret.as_str())
         .bind(scopes)
         .bind(enabled)
+        .bind(server_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// All providers joined to their bound server's name (admin list).
+    pub async fn list_providers_with_server(&self) -> Result<Vec<OidcProviderRow>, sqlx::Error> {
+        sqlx::query_as::<_, OidcProviderRow>(
+            "SELECT p.id, p.slug, p.display_name, p.issuer_url, p.enabled, p.server_id, \
+             s.name AS server_name \
+             FROM oidc_providers p LEFT JOIN servers s ON s.id = p.server_id \
+             ORDER BY (p.server_id IS NULL), s.name, p.display_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Enabled providers joined to their server name — what the login picker
+    /// groups by. Server-bound providers first (grouped by server), then global.
+    pub async fn list_enabled_providers_with_server(
+        &self,
+    ) -> Result<Vec<OidcProviderRow>, sqlx::Error> {
+        sqlx::query_as::<_, OidcProviderRow>(
+            "SELECT p.id, p.slug, p.display_name, p.issuer_url, p.enabled, p.server_id, \
+             s.name AS server_name \
+             FROM oidc_providers p LEFT JOIN servers s ON s.id = p.server_id \
+             WHERE p.enabled = 1 \
+             ORDER BY (p.server_id IS NULL), s.name, p.display_name",
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn delete_provider(&self, id: i64) -> Result<bool, sqlx::Error> {
@@ -239,6 +287,7 @@ mod tests {
             &secret,
             "openid profile email",
             true,
+            None,
         )
         .await
         .unwrap();
@@ -247,6 +296,7 @@ mod tests {
         assert_eq!(p.display_name, "Authentik");
         assert_eq!(p.client_secret.as_str(), "enc-secret");
         assert!(p.enabled);
+        assert_eq!(p.server_id, None);
 
         // upsert by slug updates in place and can disable
         s.upsert_provider(
@@ -257,6 +307,7 @@ mod tests {
             &secret,
             "openid profile email",
             false,
+            None,
         )
         .await
         .unwrap();

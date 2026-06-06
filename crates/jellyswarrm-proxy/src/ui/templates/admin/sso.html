@@ -33,6 +33,20 @@
             <label class="form-field"> <span class="field-label">Scopes</span>
                 <input type="text" name="scopes" value="openid profile email" autocomplete="off">
             </label>
+            <label class="form-field"> <span class="field-label">Server
+                <span class="info-hint" tabindex="0"
+                      title="Bind this provider to one federated backend so the login picker groups it under that server. Leave as 'All servers' to offer it everywhere."
+                      aria-label="Server help">
+                    <i class="fas fa-circle-info" aria-hidden="true"></i>
+                </span>
+            </span>
+                <select name="server_id">
+                    <option value="">All servers</option>
+                    {% for s in servers %}
+                    <option value="{{ s.0 }}">{{ s.1 }}</option>
+                    {% endfor %}
+                </select>
+            </label>
             <div class="server-form-submit">
                 <span class="field-label field-label-placeholder" aria-hidden="true">Add</span>
                 <button type="submit" class="server-form-button">Add Provider</button>

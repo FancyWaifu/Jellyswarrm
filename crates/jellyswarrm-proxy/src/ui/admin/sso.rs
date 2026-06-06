@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use crate::{
     encryption::{encrypt_password, Password},
-    oidc_storage::{OidcIdentityWithUser, OidcProvider},
+    oidc_storage::{OidcIdentityWithUser, OidcProviderRow},
     AppState,
 };
 
@@ -18,12 +18,14 @@ use crate::{
 #[template(path = "admin/sso.html")]
 pub struct SsoPageTemplate {
     pub ui_route: String,
+    /// (id, name) of every federated backend, for the per-server binding select.
+    pub servers: Vec<(i64, String)>,
 }
 
 #[derive(Template)]
 #[template(path = "admin/sso_list.html")]
 pub struct SsoListTemplate {
-    pub providers: Vec<OidcProvider>,
+    pub providers: Vec<OidcProviderRow>,
     pub ui_route: String,
 }
 
@@ -35,10 +37,12 @@ pub struct AddProviderForm {
     pub client_id: String,
     pub client_secret: String,
     pub scopes: Option<String>,
+    /// Empty string / absent = available for all servers.
+    pub server_id: Option<String>,
 }
 
 async fn render_provider_list(state: &AppState) -> Result<String, String> {
-    match state.oidc_storage.list_providers().await {
+    match state.oidc_storage.list_providers_with_server().await {
         Ok(providers) => SsoListTemplate {
             providers,
             ui_route: state.get_ui_route().await,
@@ -49,10 +53,25 @@ async fn render_provider_list(state: &AppState) -> Result<String, String> {
     }
 }
 
+/// Servers as (id, name) for the binding select, sorted by name.
+async fn server_options(state: &AppState) -> Vec<(i64, String)> {
+    match state.server_storage.list_servers().await {
+        Ok(mut servers) => {
+            servers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            servers.into_iter().map(|s| (s.id, s.name)).collect()
+        }
+        Err(e) => {
+            error!("Failed to list servers for SSO binding select: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Main SSO providers management page.
 pub async fn sso_page(State(state): State<AppState>) -> impl IntoResponse {
     let template = SsoPageTemplate {
         ui_route: state.get_ui_route().await,
+        servers: server_options(&state).await,
     };
     match template.render() {
         Ok(html) => Html(html).into_response(),
@@ -118,6 +137,24 @@ pub async fn add_provider(
         .filter(|s| !s.is_empty())
         .unwrap_or("openid profile email");
 
+    // Optional per-server binding: empty/absent = all servers. Validate the id
+    // refers to a real backend so a stale form can't orphan the provider.
+    let server_id = match form.server_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => match s.parse::<i64>() {
+            Ok(id) if state.server_storage.get_server_by_id(id).await.ok().flatten().is_some() => {
+                Some(id)
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Html("<div class=\"alert alert-error\">Selected server does not exist.</div>"),
+                )
+                    .into_response();
+            }
+        },
+    };
+
     // Encrypt the client secret with the master key (same scheme as server admins).
     let secret_plain: Password = form.client_secret.trim().into();
     let master = {
@@ -146,6 +183,7 @@ pub async fn add_provider(
             &encrypted,
             scopes,
             true,
+            server_id,
         )
         .await
     {

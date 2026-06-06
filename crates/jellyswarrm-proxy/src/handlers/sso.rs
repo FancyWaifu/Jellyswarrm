@@ -417,20 +417,24 @@ async fn provision_new_user(
     Ok(user)
 }
 
-/// Enabled providers, for the login-screen picker. Public (names only, no secrets).
+/// Enabled providers, for the login-screen picker. Public (names only, no
+/// secrets). `server_name` lets the picker group providers by which federated
+/// backend they sign into; `None` means available for all servers.
 #[derive(Serialize)]
 pub struct ProviderInfo {
     pub slug: String,
     pub display_name: String,
+    pub server_name: Option<String>,
 }
 
 pub async fn list_sso_providers(State(state): State<AppState>) -> impl IntoResponse {
-    match state.oidc_storage.list_enabled_providers().await {
+    match state.oidc_storage.list_enabled_providers_with_server().await {
         Ok(ps) => Json(
             ps.into_iter()
                 .map(|p| ProviderInfo {
                     slug: p.slug,
                     display_name: p.display_name,
+                    server_name: p.server_name,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -459,9 +463,20 @@ const INJECT_JS: &str = r#"(function(){
     var ov=document.createElement('div');ov.id='sso-picker';
     ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:99999';
     var box=document.createElement('div');
-    box.style.cssText='background:#202020;color:#fff;padding:1.5em;border-radius:8px;min-width:260px';
-    box.innerHTML='<h2 style="margin:0 0 .5em">Choose your sign-in server</h2>';
-    providers.forEach(function(p){var b=document.createElement('button');b.className='raised block emby-button';b.style.margin='.4em 0';b.textContent=p.display_name;b.onclick=function(){go(p.slug);};box.appendChild(b);});
+    box.style.cssText='background:#202020;color:#fff;padding:1.5em;border-radius:8px;min-width:260px;max-height:80vh;overflow:auto';
+    box.innerHTML='<h2 style="margin:0 0 .5em">Choose how to sign in</h2>';
+    var grouped=providers.some(function(p){return p.server_name;});
+    var last;
+    providers.forEach(function(p){
+      var g=p.server_name||null;
+      if(grouped&&g!==last){
+        var h=document.createElement('div');
+        h.style.cssText='margin:.8em 0 .2em;font-size:.8em;opacity:.7;text-transform:uppercase;letter-spacing:.05em';
+        h.textContent=g||'Other sign-in options';
+        box.appendChild(h);last=g;
+      }
+      var b=document.createElement('button');b.className='raised block emby-button';b.style.margin='.4em 0';b.textContent=p.display_name;b.onclick=function(){go(p.slug);};box.appendChild(b);
+    });
     var c=document.createElement('button');c.className='button-flat block emby-button';c.style.marginTop='.6em';c.textContent='Cancel';c.onclick=function(){ov.remove();};box.appendChild(c);
     ov.appendChild(box);ov.onclick=function(e){if(e.target===ov)ov.remove();};document.body.appendChild(ov);
   }

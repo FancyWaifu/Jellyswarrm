@@ -255,6 +255,10 @@ pub struct PreconfiguredOidcProvider {
     pub scopes: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional name of a preconfigured server to bind this provider to (for the
+    /// per-server login picker). Omit for a provider available to all servers.
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 fn default_oidc_scopes() -> String {

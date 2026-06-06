@@ -381,6 +381,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // OIDC providers.
         for p in &loaded_config.preconfigured_oidc_providers {
+            // Resolve an optional server binding (by name) to its id.
+            let server_id = match &p.server {
+                None => None,
+                Some(name) => match server_storage.get_server_by_name(name).await {
+                    Ok(Some(s)) => Some(s.id),
+                    _ => {
+                        error!(
+                            "OIDC provider '{}' binds to unknown server '{}' — leaving it available to all servers",
+                            p.slug, name
+                        );
+                        None
+                    }
+                },
+            };
             match encryption::encrypt_password(&p.client_secret.clone().into(), &master_key) {
                 Ok(enc_secret) => {
                     if let Err(e) = oidc_storage
@@ -392,14 +406,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &enc_secret,
                             &p.scopes,
                             p.enabled,
+                            server_id,
                         )
                         .await
                     {
                         error!("Failed to seed OIDC provider {}: {}", p.slug, e);
                     } else {
                         info!(
-                            "  Seeded OIDC provider '{}' ({})",
-                            p.display_name, p.issuer_url
+                            "  Seeded OIDC provider '{}' ({}){}",
+                            p.display_name,
+                            p.issuer_url,
+                            p.server
+                                .as_deref()
+                                .map(|s| format!(" -> server '{s}'"))
+                                .unwrap_or_default()
                         );
                     }
                 }
