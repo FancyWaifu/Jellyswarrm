@@ -8,7 +8,7 @@
 <section id="add-provider" aria-labelledby="add-provider-heading">
     <h2 id="add-provider-heading" class="section-heading-tight">Add Provider</h2>
     <form hx-post="/{{ ui_route }}/sso/providers" hx-target="#provider-list" hx-swap="innerHTML" hx-disabled-elt="this" hx-on::after-request="if(event.detail.successful) this.reset()">
-        <div class="server-form-grid">
+        <div class="sso-form-grid">
             <label class="form-field"> <span class="field-label">Display name</span>
                 <input type="text" name="display_name" placeholder="Authentik" autocomplete="off" required>
             </label>
@@ -56,7 +56,7 @@
 
 <section id="add-identity" aria-labelledby="add-identity-heading">
     <form hx-post="/{{ ui_route }}/sso/identities" hx-target="#identity-list" hx-swap="innerHTML" hx-disabled-elt="this" hx-on::after-request="if(event.detail.successful) this.reset()">
-        <div class="server-form-grid">
+        <div class="sso-form-grid">
             <label class="form-field"> <span class="field-label">Jellyswarrm user</span>
                 <input type="text" name="username" placeholder="username" autocomplete="off" required>
             </label>

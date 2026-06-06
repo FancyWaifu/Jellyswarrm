@@ -112,6 +112,28 @@
   min-width: 0;
 }
 
+/* SSO admin forms have more fields than the server form — lay them out in an
+   even, responsive auto-fit grid instead of a fixed column template. */
+.sso-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 1rem 1.25rem;
+  align-items: end;
+}
+
+.sso-form-grid > * {
+  min-width: 0;
+}
+
+.sso-form-grid .form-field > :where(input, select) {
+  width: 100%;
+}
+
+.sso-form-grid .server-form-button {
+  width: 100%;
+  min-width: 0;
+}
+
 .form-field {
   display: flex;
   flex-direction: column;
