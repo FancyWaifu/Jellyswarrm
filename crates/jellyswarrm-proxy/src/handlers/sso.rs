@@ -198,8 +198,9 @@ pub async fn handle_sso_callback(
             .await
             .map_err(internal)?
             .ok_or_else(|| internal("identity references a missing user"))?;
-        // Returning user: existing backend sessions (long-lived Jellyfin tokens)
-        // are reused; new devices get a lazy session on first request.
+        // Returning user: refresh stale backend tokens in place so old sessions
+        // (e.g. from prior password logins) heal instead of bouncing the client.
+        state.federated_users.refresh_user_sessions(&user).await;
         let (sid, sname) = {
             let c = state.config.read().await;
             (c.server_id.clone(), c.server_name.clone())
@@ -347,6 +348,9 @@ pub async fn handle_sso_link(
         rekeyed,
         mappings.len()
     );
+
+    // Heal any stale tokens on the freshly-linked account's existing sessions.
+    state.federated_users.refresh_user_sessions(&user).await;
 
     Ok(login_complete_page(&sid, &sname, &user.id, &user.virtual_key).into_response())
 }

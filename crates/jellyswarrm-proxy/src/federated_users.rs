@@ -650,6 +650,114 @@ impl FederatedUserService {
         created
     }
 
+    /// Refresh a user's existing backend session tokens in place: re-authenticate
+    /// each backend ONCE (via the stored mapping) and update all of the user's
+    /// sessions for that backend with the fresh token. Called on SSO login so
+    /// stale tokens left over from prior logins heal automatically — without the
+    /// re-auth storm that deleting sessions + lazy-recreating would cause against
+    /// federated peers. Returns the number of sessions refreshed.
+    pub async fn refresh_user_sessions(&self, user: &crate::user_authorization_service::User) -> usize {
+        let sessions = match self
+            .user_authorization
+            .get_user_sessions(&user.id, None)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                error!("refresh_user_sessions: list sessions failed: {}", e);
+                return 0;
+            }
+        };
+        if sessions.is_empty() {
+            return 0;
+        }
+        let mappings = match self.user_authorization.list_server_mappings(&user.id).await {
+            Ok(m) => m,
+            Err(_) => return 0,
+        };
+        let (master_key, client_info) = {
+            let config = self.config.read().await;
+            (
+                Into::<HashedPassword>::into(config.password.clone()),
+                crate::config::CLIENT_INFO.clone(),
+            )
+        };
+
+        let norm = |u: &str| u.trim_end_matches('/').to_string();
+        // Re-auth each backend at most once; cache (token, original_user_id).
+        let mut fresh: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        let mut refreshed = 0usize;
+
+        for (session, server) in &sessions {
+            let key = norm(server.url.as_str());
+            if !fresh.contains_key(&key) {
+                let Some(mapping) = mappings.iter().find(|m| norm(&m.server_url) == key) else {
+                    continue;
+                };
+                let decrypted = self.user_authorization.decrypt_server_mapping_password(
+                    mapping,
+                    &user.original_password_hash,
+                    &master_key,
+                    None,
+                    None,
+                );
+                let Ok(client) = JellyfinClient::new(server.url.as_str(), client_info.clone()) else {
+                    continue;
+                };
+                match client
+                    .authenticate_by_name_typed::<jellyfin_api::models::AuthResponse>(
+                        &mapping.mapped_username,
+                        decrypted.as_str(),
+                    )
+                    .await
+                {
+                    Ok(auth) => {
+                        fresh.insert(key.clone(), (auth.access_token, auth.user.id));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "refresh_user_sessions: re-auth failed on {}: {}",
+                            server.name, e
+                        );
+                        continue;
+                    }
+                }
+            }
+            if let Some((token, original_user_id)) = fresh.get(&key) {
+                let auth_record = crate::models::Authorization {
+                    client: session.device.client.clone(),
+                    device: session.device.device.clone(),
+                    device_id: session.device.device_id.clone(),
+                    version: session.device.version.clone(),
+                    token: None,
+                };
+                if self
+                    .user_authorization
+                    .store_authorization_session(
+                        &user.id,
+                        &session.server_url,
+                        &auth_record,
+                        token.clone(),
+                        original_user_id.clone(),
+                        None,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    refreshed += 1;
+                }
+            }
+        }
+        if refreshed > 0 {
+            info!(
+                "Refreshed {} backend session(s) for user {} on SSO login",
+                refreshed, user.id
+            );
+        }
+        refreshed
+    }
+
     pub async fn delete_user_from_all_servers(&self, username: &str) -> Vec<ServerSyncResult> {
         let mut results = Vec::new();
         let servers = match self.server_storage.list_servers().await {
