@@ -13,7 +13,7 @@ use moka::future::Cache;
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
     AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, TokenResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,20 @@ pub struct OidcClaims {
     pub issuer: String,
     pub subject: String,
     pub email: Option<String>,
+}
+
+/// Minimal id-token claims for the lenient fallback path. Only the fields we
+/// actually use are typed; every other (possibly non-spec-shaped) claim is
+/// ignored, which is what makes parsing tolerant. iss/aud/exp are still
+/// validated by `jsonwebtoken` independently of this struct.
+#[derive(Deserialize)]
+struct LenientIdClaims {
+    iss: String,
+    sub: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 #[derive(Clone)]
@@ -163,6 +177,8 @@ impl OidcService {
         }
 
         let md = self.metadata(&provider.issuer_url).await?;
+        // Captured before `md` is moved into the client — needed by the lenient path.
+        let jwks_uri = md.jwks_uri().url().as_str().to_string();
         let client = CoreClient::from_provider_metadata(
             md,
             ClientId::new(provider.client_id.clone()),
@@ -173,13 +189,26 @@ impl OidcService {
                 .map_err(|e| OidcError::Url(e.to_string()))?,
         );
 
-        let token_response = client
+        let token_response = match client
             .exchange_code(AuthorizationCode::new(code))
             .map_err(|e| OidcError::Exchange(e.to_string()))?
             .set_pkce_verifier(PkceCodeVerifier::new(state.pkce_verifier.clone()))
             .request_async(&self.http_client)
             .await
-            .map_err(|e| OidcError::Exchange(e.to_string()))?;
+        {
+            Ok(tr) => tr,
+            // The token endpoint replied, but the response (its embedded id_token)
+            // didn't fit openidconnect's strict typed model — typically a
+            // non-spec-compliant IdP (e.g. Casdoor emits `address` as an array).
+            // Re-validate the id_token leniently from the raw bytes we already have
+            // (the code is single-use, so we can't re-exchange).
+            Err(RequestTokenError::Parse(_, raw)) => {
+                return self
+                    .lenient_validate(provider, &jwks_uri, &raw, &state.nonce)
+                    .await;
+            }
+            Err(e) => return Err(OidcError::Exchange(e.to_string())),
+        };
 
         let id_token = token_response
             .id_token()
@@ -194,6 +223,73 @@ impl OidcService {
             issuer: claims.issuer().as_str().to_string(),
             subject: claims.subject().as_str().to_string(),
             email: claims.email().map(|e| e.as_str().to_string()),
+        })
+    }
+
+    /// Lenient ID-token validation for non-spec-compliant IdPs whose token
+    /// response trips openidconnect's strict typed parsing (e.g. Casdoor sends
+    /// the standard `address` claim as an array instead of an object). Security
+    /// is preserved: signature (via JWKS), issuer, audience, expiry, and nonce
+    /// are all verified — only the *shape* of non-essential claims is tolerated.
+    async fn lenient_validate(
+        &self,
+        provider: &OidcProvider,
+        jwks_uri: &str,
+        raw_token_response: &[u8],
+        expected_nonce: &str,
+    ) -> Result<OidcClaims, OidcError> {
+        use jsonwebtoken::{decode, decode_header, jwk::JwkSet, DecodingKey, Validation};
+
+        let v: serde_json::Value = serde_json::from_slice(raw_token_response)
+            .map_err(|e| OidcError::Claims(format!("lenient: token response not JSON: {e}")))?;
+        let id_token = v
+            .get("id_token")
+            .and_then(|x| x.as_str())
+            .ok_or(OidcError::MissingIdToken)?;
+
+        let header = decode_header(id_token)
+            .map_err(|e| OidcError::Claims(format!("lenient: bad JWT header: {e}")))?;
+        let kid = header
+            .kid
+            .clone()
+            .ok_or_else(|| OidcError::Claims("lenient: id_token has no 'kid'".to_string()))?;
+
+        let jwks: JwkSet = self
+            .http_client
+            .get(jwks_uri)
+            .send()
+            .await
+            .map_err(|e| OidcError::Discovery(format!("lenient: JWKS fetch failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| OidcError::Discovery(format!("lenient: JWKS parse failed: {e}")))?;
+        let jwk = jwks
+            .find(&kid)
+            .ok_or_else(|| OidcError::Claims("lenient: signing key not in JWKS".to_string()))?;
+        let key = DecodingKey::from_jwk(jwk)
+            .map_err(|e| OidcError::Claims(format!("lenient: unusable JWK: {e}")))?;
+
+        // Enforce signature alg from the header, audience, issuer, and expiry.
+        let mut validation = Validation::new(header.alg);
+        validation.set_audience(&[provider.client_id.as_str()]);
+        validation.set_issuer(&[provider.issuer_url.as_str()]);
+        validation.validate_exp = true;
+
+        let data = decode::<LenientIdClaims>(id_token, &key, &validation)
+            .map_err(|e| OidcError::Claims(format!("lenient: id_token validation failed: {e}")))?;
+
+        // Nonce binds the token to this login.
+        if data.claims.nonce.as_deref() != Some(expected_nonce) {
+            return Err(OidcError::Claims("lenient: nonce mismatch".to_string()));
+        }
+
+        tracing::info!(
+            "OIDC: validated id_token via lenient fallback (non-spec-compliant IdP claim shapes)"
+        );
+        Ok(OidcClaims {
+            issuer: data.claims.iss,
+            subject: data.claims.sub,
+            email: data.claims.email,
         })
     }
 }

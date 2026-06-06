@@ -64,6 +64,7 @@ jellyfin-api = { workspace = true }
 futures-util = { workspace = true }
 governor = { workspace = true }
 openidconnect = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

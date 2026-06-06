@@ -18,6 +18,7 @@ governor = "0.10.0"
 
 # SSO / OIDC
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+jsonwebtoken = "9"
 
 # UI
 askama = { version = "0.14.0" }
