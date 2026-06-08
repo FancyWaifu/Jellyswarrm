@@ -39,6 +39,45 @@ static ITEM_MATCH_CACHE: LazyLock<Cache<(i64, String), Option<String>>> = LazyLo
         .build()
 });
 
+/// Per-(user,item) last-synced playback position, to throttle progress syncs.
+/// Without this, a paused client re-reports the same position every ~10s and we'd
+/// re-sync it to every peer each time. 2h TTL (covers a long movie).
+static LAST_SYNC_POS: LazyLock<Cache<(String, String), i64>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(50_000)
+        .time_to_live(Duration::from_secs(7200))
+        .build()
+});
+
+/// Only sync a playback position when it has moved enough to matter — every ~30s
+/// of progress. (1 tick = 100ns, so 30s = 300_000_000 ticks.)
+const POSITION_SYNC_THRESHOLD_TICKS: i64 = 300_000_000;
+
+/// Whether a progress report at `position_ticks` is worth fanning out. `final_stop`
+/// (playback stopped) always syncs and clears the throttle. Otherwise it syncs
+/// only if the position moved ≥ the threshold since the last sync for this item —
+/// so running playback propagates promptly while a paused/idle client (same
+/// position re-reported every 10s) doesn't spam every peer.
+pub async fn should_sync_position(
+    user_id: &str,
+    item_id: &str,
+    position_ticks: i64,
+    final_stop: bool,
+) -> bool {
+    let key = (user_id.to_string(), item_id.to_string());
+    if final_stop {
+        LAST_SYNC_POS.insert(key, position_ticks).await;
+        return true;
+    }
+    match LAST_SYNC_POS.get(&key).await {
+        Some(last) if (position_ticks - last).abs() < POSITION_SYNC_THRESHOLD_TICKS => false,
+        _ => {
+            LAST_SYNC_POS.insert(key, position_ticks).await;
+            true
+        }
+    }
+}
+
 /// Outcome of trying to sync one peer — drives the retry queue.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PeerOutcome {
@@ -465,6 +504,22 @@ mod tests {
         ]);
         assert_eq!(a.cache_key(), b.cache_key());
         assert_eq!(a.cache_key(), "imdb.tt1,tmdb.22");
+    }
+
+    #[tokio::test]
+    async fn position_throttle_skips_small_moves_but_allows_stop() {
+        let u = "throttle-test-user";
+        let i = "item-A";
+        // First report always syncs (no prior).
+        assert!(should_sync_position(u, i, 1_000_000_000, false).await);
+        // A tiny move (< 30s) is throttled.
+        assert!(!should_sync_position(u, i, 1_000_000_001, false).await);
+        // Same position re-reported (paused client) — throttled, no spam.
+        assert!(!should_sync_position(u, i, 1_000_000_001, false).await);
+        // A move past the threshold syncs.
+        assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_000, false).await);
+        // A stop always syncs even if the position barely changed.
+        assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_001, true).await);
     }
 
     #[test]

@@ -976,30 +976,32 @@ async fn proxy_handler(
     let is_playing_report = method == reqwest::Method::POST
         && watched_sync::is_playing_report_path(request_url.path());
     let playing_is_stopped = request_url.path().trim_end_matches('/').ends_with("/Stopped");
-    // For playback reports we capture the *virtual* ItemId from the body (below)
-    // and resolve its owning backend ourselves — the request may be routed to a
-    // different backend (a version-picker source), so we can't trust the route.
+    // For playback reports we capture the *virtual* ItemId + position from the body
+    // (below) and resolve its owning backend ourselves — the request may be routed
+    // to a different backend (a version-picker source), so we can't trust the
+    // route. Syncing is throttled by position movement (see should_sync_position),
+    // so running playback propagates promptly without spamming peers when paused.
     let mut playing_item_virtual: Option<String> = None;
+    let mut playing_position_ticks: i64 = 0;
 
     let payload_processing_context = RequestProcessingContext::new(&preprocessed);
     let mut request = preprocessed.request;
 
     let preprocessor = &state.processors.request_processor;
     if let Some(mut json_value) = body_to_json(&request) {
-        // Playback report: sync only on stop or pause (not every running tick).
-        // Capture the *virtual* ItemId from the original body (before id-mapping)
-        // so we can resolve its true owning backend, not the routed one.
+        // Playback report: capture the *virtual* ItemId + position from the
+        // original body (before id-mapping) so we can resolve its true owning
+        // backend, not the routed one. The throttle (should_sync_position) decides
+        // whether this report is worth fanning out.
         if is_playing_report {
-            let paused = json_value
-                .get("IsPaused")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
-            if playing_is_stopped || paused {
-                playing_item_virtual = json_value
-                    .get("ItemId")
-                    .and_then(|i| i.as_str())
-                    .map(str::to_string);
-            }
+            playing_item_virtual = json_value
+                .get("ItemId")
+                .and_then(|i| i.as_str())
+                .map(str::to_string);
+            playing_position_ticks = json_value
+                .get("PositionTicks")
+                .and_then(|p| p.as_i64())
+                .unwrap_or(0);
         }
         let response =
             processors::process_json(&mut json_value, preprocessor, &payload_processing_context)
@@ -1042,17 +1044,33 @@ async fn proxy_handler(
                 // backend owns it.
                 Some((routed_server_id, real_item))
             } else if let Some(virtual_item) = playing_item_virtual {
-                // Playback report: resolve the item's true owner from its mapping.
-                match state
-                    .media_storage
-                    .get_media_mapping_with_server(&virtual_item)
-                    .await
+                // Throttle: only fan out when the position has moved enough (or on
+                // stop), so running playback propagates but a paused/idle client
+                // doesn't re-sync the same position to every peer every ~10s.
+                if watched_sync::should_sync_position(
+                    &user_id,
+                    &virtual_item,
+                    playing_position_ticks,
+                    playing_is_stopped,
+                )
+                .await
                 {
-                    Ok(Some((mapping, server))) => Some((server.id, mapping.original_media_id)),
-                    _ => {
-                        debug!("sync: no media mapping for played item {virtual_item}; skipping");
-                        None
+                    // Resolve the item's true owner from its mapping.
+                    match state
+                        .media_storage
+                        .get_media_mapping_with_server(&virtual_item)
+                        .await
+                    {
+                        Ok(Some((mapping, server))) => {
+                            Some((server.id, mapping.original_media_id))
+                        }
+                        _ => {
+                            debug!("sync: no media mapping for {virtual_item}; skipping");
+                            None
+                        }
                     }
+                } else {
+                    None
                 }
             } else {
                 None
