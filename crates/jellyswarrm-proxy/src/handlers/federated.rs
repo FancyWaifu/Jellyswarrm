@@ -789,6 +789,10 @@ pub async fn debug_explain(
         let Some(mut request) = original_request.try_clone() else {
             continue;
         };
+        // The incoming path is /_debug/explain, which backends don't serve — point
+        // the fan-out at the real item-list endpoint instead (mirrors how the live
+        // handler is mounted at /Items). Query (ParentId etc.) is preserved.
+        request.url_mut().set_path("/Items");
         ensure_provider_ids_field(&mut request);
         if let Some(pid) = parent_map.as_ref().and_then(|m| m.get(&server.id)) {
             set_parent_id(&mut request, pid);
