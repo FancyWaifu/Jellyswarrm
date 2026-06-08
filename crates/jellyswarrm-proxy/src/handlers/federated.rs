@@ -712,6 +712,17 @@ fn friendly_view_name(ct: &CollectionType) -> Option<&'static str> {
     })
 }
 
+/// Drop the federated " [Server]" suffix `process_media_item` appends, so a
+/// single-backend library tile reads as its real name ("Education Section", not
+/// "Education Section [Travis jellyfin]"). Leaves names without the suffix as-is.
+fn strip_server_suffix(name: &str) -> &str {
+    if name.ends_with(']') {
+        name.rsplit_once(" [").map(|(base, _)| base).unwrap_or(name)
+    } else {
+        name
+    }
+}
+
 /// Collapse library views of the SAME collection type across backends into one
 /// canonical view (highest-priority backend), preserving order, and register each
 /// merge group in the registry so a later browse fans out across every member
@@ -729,6 +740,18 @@ async fn dedup_and_register_views(
 
     for (item, priority) in items {
         let Some(ct) = item.collection_type.as_ref() else {
+            // A library view without a declared type (a "mixed content" library):
+            // can't type-merge it, but still drop the "[server]" suffix so the tile
+            // reads cleanly. Non-library items (movies, episodes…) keep their tag.
+            let mut item = item;
+            if matches!(
+                item.item_type,
+                BaseItemKind::UserView | BaseItemKind::CollectionFolder
+            ) {
+                if let Some(n) = item.name.as_deref() {
+                    item.name = Some(strip_server_suffix(n).to_string());
+                }
+            }
             out.push((item, priority));
             continue;
         };
@@ -765,8 +788,9 @@ async fn dedup_and_register_views(
 
     for (key, members) in group_members {
         if let Some(&idx) = canonical_idx.get(&key) {
-            // A view that actually spans multiple backend libraries gets a neutral
-            // type-based name (its winning backend's name would be misleading).
+            // A view spanning multiple backend libraries gets a neutral type-based
+            // name (the winning backend's name would be misleading). A single-backend
+            // library keeps its real name, just without the "[server]" suffix.
             if members.len() > 1 {
                 if let Some(friendly) = out[idx]
                     .0
@@ -776,6 +800,8 @@ async fn dedup_and_register_views(
                 {
                     out[idx].0.name = Some(friendly.to_string());
                 }
+            } else if let Some(n) = out[idx].0.name.as_deref() {
+                out[idx].0.name = Some(strip_server_suffix(n).to_string());
             }
             state.view_merge.register(out[idx].0.id.clone(), members);
         }
@@ -982,6 +1008,16 @@ pub async fn debug_explain(
 mod dedup_tests {
     use super::*;
     use crate::models::MediaItem;
+
+    #[test]
+    fn strip_server_suffix_cases() {
+        assert_eq!(strip_server_suffix("Education Section [Travis jellyfin]"), "Education Section");
+        assert_eq!(strip_server_suffix("Media [Whiskey jellyfin]"), "Media");
+        assert_eq!(strip_server_suffix("Movies"), "Movies");
+        // Names without a trailing "]" are untouched (only runs on library tiles).
+        assert_eq!(strip_server_suffix("Plain Name"), "Plain Name");
+        assert_eq!(strip_server_suffix("4K [HDR"), "4K [HDR");
+    }
 
     fn movie(id: &str, imdb: Option<&str>) -> MediaItem {
         let mut m: MediaItem = serde_json::from_value(serde_json::json!({
