@@ -24,6 +24,16 @@ use crate::{
 static SERIES_OR_PARENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new("(?i)(seriesid|parentid)").unwrap());
 
+/// The backend a client has scoped its browsing to (via the injected server
+/// switcher), read from the `X-Js-Server` header. When set, federated reads show
+/// only that one backend's content instead of the merged federation.
+pub fn scope_server_id(req: &Request) -> Option<i64> {
+    req.headers()
+        .get("X-Js-Server")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
 pub async fn get_items_from_all_servers_if_not_restricted(
     State(state): State<AppState>,
     req: Request,
@@ -35,10 +45,13 @@ pub async fn get_items_from_all_servers_if_not_restricted(
         if SERIES_OR_PARENT_RE.is_match(query) {
             // If the parent is a *merged* library, fan out across the backends it
             // stands in for (each with its own library id) and dedup, instead of
-            // routing to a single backend.
-            if let Some(parent_id) = parent_id_from_query(query) {
-                if let Some(members) = state.view_merge.members(&parent_id) {
-                    return get_items_from_all_servers_inner(state, req, Some(members)).await;
+            // routing to a single backend. Skipped when the client is scoped to a
+            // single server — then a parent browse routes straight to that backend.
+            if scope_server_id(&req).is_none() {
+                if let Some(parent_id) = parent_id_from_query(query) {
+                    if let Some(members) = state.view_merge.members(&parent_id) {
+                        return get_items_from_all_servers_inner(state, req, Some(members)).await;
+                    }
                 }
             }
             return get_items(State(state), req).await;
@@ -65,6 +78,12 @@ async fn get_items_from_all_servers_inner(
     req: Request,
     parent_override: Option<Vec<(i64, String)>>,
 ) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
+    // A client scoped to one backend (server switcher) gets just that backend's
+    // content: filter the fan-out to it and skip merge/dedup so its libraries and
+    // items pass through verbatim.
+    let scope = scope_server_id(&req);
+    let parent_override = if scope.is_some() { None } else { parent_override };
+
     let (original_request, _, _, sessions, _) =
         extract_request_infos(req, &state).await.map_err(|e| {
             error!("Failed to preprocess request: {}", e);
@@ -82,6 +101,11 @@ async fn get_items_from_all_servers_inner(
     // dragging the whole dashboard's latency to its timeout ceiling.
     let mut filtered_sessions = Vec::with_capacity(sessions.len());
     for (session, server) in sessions {
+        if let Some(sid) = scope {
+            if server.id != sid {
+                continue;
+            }
+        }
         if state.backend_health.is_ejected(server.id).await {
             info!(
                 "Skipping ejected backend '{}' (id={}) on federated fanout",
@@ -95,7 +119,11 @@ async fn get_items_from_all_servers_inner(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    let dedup_movies = state.config.read().await.dedup_movies;
+    let dedup_movies = if scope.is_some() {
+        false
+    } else {
+        state.config.read().await.dedup_movies
+    };
 
     // Build the fan-out targets. Normally one request per backend; for a merged
     // view, one request per member library (so a backend with several libraries
@@ -478,7 +506,8 @@ pub async fn get_series_children(
     let is_episodes = full_path.to_lowercase().ends_with("/episodes");
     let series_id = shows_series_id(&full_path);
 
-    if state.config.read().await.dedup_movies {
+    // Scoped to one backend → don't fan out; route to that server's copy.
+    if scope_server_id(&req).is_none() && state.config.read().await.dedup_movies {
         if let Some(sid) = series_id {
             if let Some(members) = state.view_merge.members(&sid) {
                 return fanout_series_children(state, req, members, is_episodes).await;

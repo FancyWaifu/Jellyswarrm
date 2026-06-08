@@ -560,6 +560,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/sso/link", post(handlers::sso::handle_sso_link))
             .route("/sso/providers", get(handlers::sso::list_sso_providers))
             .route("/sso/inject.js", get(handlers::sso::sso_inject_js))
+            // Server switcher (nav-drawer list of backends + scope script).
+            .route("/servers", get(handlers::server_nav::list_servers))
+            .route(
+                "/servers/inject.js",
+                get(handlers::server_nav::servers_inject_js),
+            )
             // Diagnostics (gated by master password in X-Debug-Key header).
             .route(
                 "/_debug/viewmerge",
@@ -891,7 +897,8 @@ async fn index_handler(
         if let Some(content) = Asset::get("index.html") {
             // Inject the SSO login-button script into the served web client.
             let html = String::from_utf8_lossy(&content.data);
-            let script = "<script src=\"/sso/inject.js\" defer></script>";
+            let script = "<script src=\"/sso/inject.js\" defer></script>\
+                          <script src=\"/servers/inject.js\" defer></script>";
             let injected = if html.contains("</body>") {
                 html.replacen("</body>", &format!("{script}</body>"), 1)
             } else {
