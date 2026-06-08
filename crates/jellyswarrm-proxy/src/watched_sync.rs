@@ -53,11 +53,17 @@ static LAST_SYNC_POS: LazyLock<Cache<(String, String), i64>> = LazyLock::new(|| 
 /// of progress. (1 tick = 100ns, so 30s = 300_000_000 ticks.)
 const POSITION_SYNC_THRESHOLD_TICKS: i64 = 300_000_000;
 
-/// Whether a progress report at `position_ticks` is worth fanning out. `final_stop`
-/// (playback stopped) always syncs and clears the throttle. Otherwise it syncs
-/// only if the position moved ≥ the threshold since the last sync for this item —
-/// so running playback propagates promptly while a paused/idle client (same
-/// position re-reported every 10s) doesn't spam every peer.
+/// Allow a little backward jitter (10s) before treating a report as a regression.
+const BACKWARD_TOLERANCE_TICKS: i64 = 100_000_000;
+
+/// Whether a progress report at `position_ticks` is worth fanning out.
+///
+/// Resume position is **monotonic forward** per (user, item): a report behind the
+/// furthest position we've synced is ignored — that's a stale client resuming at
+/// an old spot or a backgrounded/paused "ghost" session, and it must NOT drag the
+/// resume point backward on every other server. A forward report syncs when it
+/// advanced ≥ the threshold (or on `final_stop`), so running playback propagates
+/// promptly while a paused/idle client re-reporting the same spot doesn't spam.
 pub async fn should_sync_position(
     user_id: &str,
     item_id: &str,
@@ -65,17 +71,16 @@ pub async fn should_sync_position(
     final_stop: bool,
 ) -> bool {
     let key = (user_id.to_string(), item_id.to_string());
-    if final_stop {
-        LAST_SYNC_POS.insert(key, position_ticks).await;
+    let furthest = LAST_SYNC_POS.get(&key).await.unwrap_or(0);
+    // Going backward (beyond jitter) → stale/ghost report; never regress.
+    if position_ticks + BACKWARD_TOLERANCE_TICKS < furthest {
+        return false;
+    }
+    if final_stop || position_ticks - furthest >= POSITION_SYNC_THRESHOLD_TICKS {
+        LAST_SYNC_POS.insert(key, position_ticks.max(furthest)).await;
         return true;
     }
-    match LAST_SYNC_POS.get(&key).await {
-        Some(last) if (position_ticks - last).abs() < POSITION_SYNC_THRESHOLD_TICKS => false,
-        _ => {
-            LAST_SYNC_POS.insert(key, position_ticks).await;
-            true
-        }
-    }
+    false
 }
 
 /// Outcome of trying to sync one peer — drives the retry queue.
@@ -518,8 +523,12 @@ mod tests {
         assert!(!should_sync_position(u, i, 1_000_000_001, false).await);
         // A move past the threshold syncs.
         assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_000, false).await);
-        // A stop always syncs even if the position barely changed.
+        // A stop syncs even if the position barely changed (still forward).
         assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_001, true).await);
+        // A report far BEHIND the furthest (stale/ghost client) is ignored, even
+        // on stop — resume must not regress.
+        assert!(!should_sync_position(u, i, 12_000_000, false).await);
+        assert!(!should_sync_position(u, i, 12_000_000, true).await);
     }
 
     #[test]
