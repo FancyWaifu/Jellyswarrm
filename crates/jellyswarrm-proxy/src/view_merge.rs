@@ -42,4 +42,9 @@ impl ViewMergeRegistry {
     pub fn members(&self, view_id: &str) -> Option<Vec<(i64, String)>> {
         self.groups.read().unwrap().get(view_id).cloned()
     }
+
+    /// Snapshot the whole registry (canonical id -> members) for diagnostics.
+    pub fn dump(&self) -> HashMap<String, Vec<(i64, String)>> {
+        self.groups.read().unwrap().clone()
+    }
 }

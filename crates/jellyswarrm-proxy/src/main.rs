@@ -560,6 +560,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/sso/link", post(handlers::sso::handle_sso_link))
             .route("/sso/providers", get(handlers::sso::list_sso_providers))
             .route("/sso/inject.js", get(handlers::sso::sso_inject_js))
+            // Diagnostics (gated by master password in X-Debug-Key header).
+            .route(
+                "/_debug/viewmerge",
+                get(handlers::federated::debug_viewmerge),
+            )
+            .route("/_debug/explain", get(handlers::federated::debug_explain))
             .route(
                 "/QuickConnect/Enabled",
                 get(handlers::quick_connect::handle_quick_connect_enabled),

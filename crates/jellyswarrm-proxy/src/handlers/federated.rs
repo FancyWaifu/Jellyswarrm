@@ -695,6 +695,197 @@ async fn dedup_and_register_views(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostics
+//
+// Debug-only endpoints for inspecting dedup behaviour without a client. Both are
+// gated by the master password sent in an `X-Debug-Key` header, so they can't be
+// hit anonymously. They reuse the real federation machinery (same auth, same
+// fan-out, same `process_media_item`) so what they report matches what a client
+// would actually see.
+// ---------------------------------------------------------------------------
+
+/// Pull the `X-Debug-Key` header out as an owned string (so nothing borrowing the
+/// non-`Sync` request is held across an await in the handler).
+fn debug_key(req: &Request) -> Option<String> {
+    req.headers()
+        .get("X-Debug-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// True if `key` matches the configured master password.
+async fn debug_password_ok(state: &AppState, key: Option<&str>) -> bool {
+    match key {
+        Some(k) => k == state.config.read().await.password.as_str(),
+        None => false,
+    }
+}
+
+/// `GET /_debug/viewmerge` — dump the in-memory view-merge registry (canonical
+/// merged-view/series id -> the per-backend ids it stands in for). This is the
+/// state that decides whether a browse fans out across backends; empty members
+/// for a series means it won't dedup or fan out.
+pub async fn debug_viewmerge(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let key = debug_key(&req);
+    if !debug_password_ok(&state, key.as_deref()).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let groups: Vec<serde_json::Value> = state
+        .view_merge
+        .dump()
+        .into_iter()
+        .map(|(canonical, members)| {
+            serde_json::json!({
+                "canonicalId": canonical,
+                "members": members
+                    .into_iter()
+                    .map(|(sid, vid)| serde_json::json!({"serverId": sid, "virtualId": vid}))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "count": groups.len(),
+        "groups": groups,
+    })))
+}
+
+/// `GET /_debug/explain[?ParentId=...]` — replay the federated item fan-out for
+/// the calling user and report, per backend, every item with its resolved
+/// `provider_key`. Then summarise: which items share a provider key (would
+/// dedup), and which Movies/Series have NO identifying provider id (the usual
+/// reason duplicates don't collapse). With `ParentId` of a merged library, it
+/// fans that library out across its member backends exactly like a real browse.
+pub async fn debug_explain(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let key = debug_key(&req);
+    if !debug_password_ok(&state, key.as_deref()).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let parent_id = req.uri().query().and_then(parent_id_from_query);
+
+    let (original_request, _, _, sessions, _) =
+        extract_request_infos(req, &state).await.map_err(|e| {
+            error!("debug_explain preprocess: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+    let sessions = sessions.ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // If the ParentId is a merged library, map it to each backend's own id so the
+    // fan-out hits real libraries (mirrors get_items_from_all_servers_inner).
+    let parent_map: Option<std::collections::HashMap<i64, String>> = parent_id
+        .as_ref()
+        .and_then(|pid| state.view_merge.members(pid))
+        .map(|m| m.into_iter().collect());
+
+    let mut join_set = JoinSet::new();
+    for (session, server) in sessions {
+        let Some(mut request) = original_request.try_clone() else {
+            continue;
+        };
+        ensure_provider_ids_field(&mut request);
+        if let Some(pid) = parent_map.as_ref().and_then(|m| m.get(&server.id)) {
+            set_parent_id(&mut request, pid);
+        }
+        let auth = JellyfinAuthorization::Authorization(session.to_authorization());
+        let state_c = state.clone();
+        join_set.spawn(async move {
+            apply_to_request(&mut request, &server, &Some(session), &Some(auth), &state_c).await;
+            let call = execute_json_request::<crate::models::ItemsResponseVariants>(
+                &state_c.reqwest_client,
+                request,
+            );
+            let sid = { state_c.config.read().await.server_id.clone() };
+            match tokio::time::timeout(DEFAULT_BACKEND_TIMEOUT, call).await {
+                Ok(Ok(resp)) => {
+                    let mut rows = Vec::new();
+                    for item in resp_into_items(resp) {
+                        let p = process_media_item(item.clone(), &state_c, &server, true, &sid)
+                            .await
+                            .unwrap_or(item);
+                        rows.push(serde_json::json!({
+                            "name": p.name,
+                            "type": format!("{:?}", p.item_type),
+                            "isFolder": p.is_folder,
+                            "collectionType": p.collection_type.as_ref().map(|c| format!("{c:?}")),
+                            "virtualId": p.id,
+                            "providerIds": p.provider_ids,
+                            "providerKey": provider_key(&p),
+                        }));
+                    }
+                    serde_json::json!({
+                        "server": server.name,
+                        "serverId": server.id,
+                        "priority": server.priority,
+                        "count": rows.len(),
+                        "items": rows,
+                    })
+                }
+                _ => serde_json::json!({
+                    "server": server.name,
+                    "serverId": server.id,
+                    "error": "timeout_or_error",
+                }),
+            }
+        });
+    }
+    let mut servers: Vec<serde_json::Value> = Vec::new();
+    while let Some(r) = join_set.join_next().await {
+        if let Ok(v) = r {
+            servers.push(v);
+        }
+    }
+
+    // Cross-server summary: group by provider key (these would dedup), and list
+    // dedupable items that lack an identifying id (these can't, and so duplicate).
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut unmatched: Vec<serde_json::Value> = Vec::new();
+    for s in &servers {
+        let sname = s.get("server").cloned().unwrap_or(serde_json::Value::Null);
+        let Some(items) = s.get("items").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for it in items {
+            let typ = it.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let entry = serde_json::json!({
+                "server": sname, "name": it.get("name"), "type": typ,
+                "providerIds": it.get("providerIds"),
+            });
+            match it.get("providerKey").and_then(|v| v.as_str()) {
+                Some(k) => groups.entry(k.to_string()).or_default().push(entry),
+                None if typ == "Movie" || typ == "Series" => unmatched.push(entry),
+                None => {}
+            }
+        }
+    }
+    let mut dedup_groups: Vec<serde_json::Value> = groups
+        .into_iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(k, members)| serde_json::json!({"providerKey": k, "members": members}))
+        .collect();
+    dedup_groups.sort_by(|a, b| {
+        a["providerKey"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["providerKey"].as_str().unwrap_or(""))
+    });
+
+    Ok(Json(serde_json::json!({
+        "parentId": parent_id,
+        "mergedLibrary": parent_map.is_some(),
+        "servers": servers,
+        "wouldDedup": dedup_groups,
+        "cannotDedupNoProviderId": unmatched,
+    })))
+}
+
 #[cfg(test)]
 mod dedup_tests {
     use super::*;
