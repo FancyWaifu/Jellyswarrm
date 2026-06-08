@@ -16,6 +16,8 @@ use crate::{
     },
     models::enums::{BaseItemKind, CollectionType},
     request_preprocessing::{apply_to_request, extract_request_infos, JellyfinAuthorization},
+    server_storage::Server,
+    user_authorization_service::AuthorizationSession,
     AppState,
 };
 
@@ -36,9 +38,7 @@ pub async fn get_items_from_all_servers_if_not_restricted(
             // routing to a single backend.
             if let Some(parent_id) = parent_id_from_query(query) {
                 if let Some(members) = state.view_merge.members(&parent_id) {
-                    let map: std::collections::HashMap<i64, String> =
-                        members.into_iter().collect();
-                    return get_items_from_all_servers_inner(state, req, Some(map)).await;
+                    return get_items_from_all_servers_inner(state, req, Some(members)).await;
                 }
             }
             return get_items(State(state), req).await;
@@ -55,13 +55,15 @@ pub async fn get_items_from_all_servers(
     get_items_from_all_servers_inner(state, req, None).await
 }
 
-/// `parent_override`: when set (a merged-library browse), each backend's request
-/// gets its `ParentId` replaced by that backend's own library id, so a single
-/// merged view fans out across the libraries it stands in for.
+/// `parent_override`: when set (a merged-library browse), the fan-out targets the
+/// member libraries this view stands in for — each `(server_id, library_id)` pair
+/// gets its own request with `ParentId` set to that backend's library. A single
+/// backend can contribute several libraries (e.g. one server's Anime + Cartoon
+/// Shows both feeding the unified TV view), so it may be queried more than once.
 async fn get_items_from_all_servers_inner(
     state: AppState,
     req: Request,
-    parent_override: Option<std::collections::HashMap<i64, String>>,
+    parent_override: Option<Vec<(i64, String)>>,
 ) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
     let (original_request, _, _, sessions, _) =
         extract_request_infos(req, &state).await.map_err(|e| {
@@ -93,14 +95,36 @@ async fn get_items_from_all_servers_inner(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // Per-index backend priority (the higher-priority copy wins when deduping the
-    // same movie), and whether movie dedup is on — captured before the move below.
-    let server_priorities: Vec<i32> = filtered_sessions.iter().map(|(_, s)| s.priority).collect();
     let dedup_movies = state.config.read().await.dedup_movies;
+
+    // Build the fan-out targets. Normally one request per backend; for a merged
+    // view, one request per member library (so a backend with several libraries
+    // feeding the same merged view — e.g. Anime + Cartoon Shows — is queried once
+    // per library). Each target carries the `ParentId` to send and its backend
+    // priority (the higher-priority copy wins when deduping).
+    let targets: Vec<(AuthorizationSession, Server, Option<String>)> = match parent_override {
+        Some(members) => members
+            .into_iter()
+            .filter_map(|(sid, lib_id)| {
+                filtered_sessions
+                    .iter()
+                    .find(|(_, s)| s.id == sid)
+                    .map(|(se, sv)| (se.clone(), sv.clone(), Some(lib_id)))
+            })
+            .collect(),
+        None => filtered_sessions
+            .into_iter()
+            .map(|(se, sv)| (se, sv, None))
+            .collect(),
+    };
+    if targets.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let server_priorities: Vec<i32> = targets.iter().map(|(_, s, _)| s.priority).collect();
 
     let mut join_set = JoinSet::new();
 
-    for (index, (session, server)) in filtered_sessions.into_iter().enumerate() {
+    for (index, (session, server, parent_lib)) in targets.into_iter().enumerate() {
         let request = match original_request.try_clone() {
             Some(req) => req,
             None => {
@@ -116,8 +140,8 @@ async fn get_items_from_all_servers_inner(
         if dedup_movies {
             ensure_provider_ids_field(&mut request);
         }
-        // Merged-library browse: point this backend at its own library.
-        if let Some(pid) = parent_override.as_ref().and_then(|m| m.get(&server.id)) {
+        // Merged-library browse: point this request at its member library.
+        if let Some(pid) = parent_lib.as_ref() {
             set_parent_id(&mut request, pid);
         }
         let state_clone = state.clone();
@@ -502,22 +526,25 @@ async fn fanout_series_children(
     members: Vec<(i64, String)>,
     is_episodes: bool,
 ) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
-    use std::collections::HashMap;
-    let member_map: HashMap<i64, String> = members.into_iter().collect();
     let (original_request, _, _, sessions, _) = extract_request_infos(req, &state).await.map_err(|e| {
         error!("series fanout preprocess: {}", e);
         StatusCode::BAD_REQUEST
     })?;
     let sessions = sessions.ok_or(StatusCode::UNAUTHORIZED)?;
 
+    // One request per member (server, backend series id). A merged series can span
+    // several libraries on the same backend, so a server may be queried more than
+    // once — resolve its session per member rather than iterating servers.
     let mut join_set = JoinSet::new();
-    for (session, server) in sessions {
-        let Some(backend_series_id) = member_map.get(&server.id).cloned() else {
+    for (server_id, backend_series_id) in members {
+        let Some((session, server)) = sessions.iter().find(|(_, s)| s.id == server_id) else {
             continue;
         };
-        if state.backend_health.is_ejected(server.id).await {
+        if state.backend_health.is_ejected(server_id).await {
             continue;
         }
+        let session = session.clone();
+        let server = server.clone();
         let Some(mut request) = original_request.try_clone() else {
             continue;
         };
@@ -637,9 +664,30 @@ fn parent_id_from_query(query: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
-/// Collapse same-type library views across backends into one canonical view
-/// (highest-priority backend), preserving order, and register each merge group
-/// in the registry so a later browse of that view fans out across its backends.
+/// A clean display name for a merged view, by collection type — so a unified view
+/// spanning differently-named libraries (e.g. Anime + Cartoon Shows + Shows) gets
+/// a neutral label instead of whichever backend's library happened to win.
+fn friendly_view_name(ct: &CollectionType) -> Option<&'static str> {
+    Some(match ct {
+        CollectionType::Movies => "Movies",
+        CollectionType::TvShows => "TV Shows",
+        CollectionType::Music => "Music",
+        CollectionType::MusicVideos => "Music Videos",
+        CollectionType::HomeVideos => "Home Videos",
+        CollectionType::BoxSets => "Collections",
+        CollectionType::Books => "Books",
+        CollectionType::Photos => "Photos",
+        CollectionType::Playlists => "Playlists",
+        CollectionType::Trailers => "Trailers",
+        _ => return None,
+    })
+}
+
+/// Collapse library views of the SAME collection type across backends into one
+/// canonical view (highest-priority backend), preserving order, and register each
+/// merge group in the registry so a later browse fans out across every member
+/// library it stands in for — including several libraries on one backend (e.g. a
+/// server's Anime + Cartoon Shows both feeding the unified "TV Shows" view).
 /// Items without a `collection_type` (i.e. not libraries) pass through.
 async fn dedup_and_register_views(
     state: &AppState,
@@ -666,12 +714,11 @@ async fn dedup_and_register_views(
             out.push((item, priority));
             continue;
         };
-        // Merge only libraries that are the SAME (name + type) across backends —
-        // not every library that happens to share a collection type. The proxy
-        // appends " [server]" to names, so match on the base name.
-        let name = item.name.as_deref().unwrap_or("");
-        let base_name = name.rsplit_once(" [").map(|(b, _)| b).unwrap_or(name);
-        let key = format!("{}|{ct:?}", base_name.to_lowercase());
+        // Merge every library of the same collection type across backends into one
+        // unified view (so the same show/movie in differently-named libraries on
+        // different servers — Anime vs Cartoon Shows vs Shows — collapses instead
+        // of duplicating).
+        let key = format!("{ct:?}");
         group_members
             .entry(key.clone())
             .or_default()
@@ -689,6 +736,18 @@ async fn dedup_and_register_views(
 
     for (key, members) in group_members {
         if let Some(&idx) = canonical_idx.get(&key) {
+            // A view that actually spans multiple backend libraries gets a neutral
+            // type-based name (its winning backend's name would be misleading).
+            if members.len() > 1 {
+                if let Some(friendly) = out[idx]
+                    .0
+                    .collection_type
+                    .as_ref()
+                    .and_then(friendly_view_name)
+                {
+                    out[idx].0.name = Some(friendly.to_string());
+                }
+            }
             state.view_merge.register(out[idx].0.id.clone(), members);
         }
     }
