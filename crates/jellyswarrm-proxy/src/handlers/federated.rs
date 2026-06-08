@@ -72,6 +72,11 @@ pub async fn get_items_from_all_servers(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    // Per-index backend priority (the higher-priority copy wins when deduping the
+    // same movie), and whether movie dedup is on — captured before the move below.
+    let server_priorities: Vec<i32> = filtered_sessions.iter().map(|(_, s)| s.priority).collect();
+    let dedup_movies = state.config.read().await.dedup_movies;
+
     let mut join_set = JoinSet::new();
 
     for (index, (session, server)) in filtered_sessions.into_iter().enumerate() {
@@ -85,6 +90,11 @@ pub async fn get_items_from_all_servers(
 
         let auth = JellyfinAuthorization::Authorization(session.to_authorization());
         let mut request = request;
+        // Dedup needs each item's ProviderIds, which list views don't request by
+        // default — ensure the backend returns them.
+        if dedup_movies {
+            ensure_provider_ids_field(&mut request);
+        }
         let state_clone = state.clone();
         let server_clone = server.clone();
         let session_clone = session.clone();
@@ -191,25 +201,27 @@ pub async fn get_items_from_all_servers(
     // Sort results by original server order
     indexed_results.sort_by_key(|(index, _)| *index);
 
-    // Extract items in original server order
-    let mut server_items: Vec<crate::models::ItemsResponseVariants> = Vec::new();
-    for (_, items) in indexed_results {
+    // Extract items in original server order, tagged with their backend priority.
+    let mut server_items: Vec<(i32, crate::models::ItemsResponseVariants)> = Vec::new();
+    for (index, items) in indexed_results {
         if let Some(items) = items {
-            server_items.push(items);
+            let priority = server_priorities.get(index).copied().unwrap_or(0);
+            server_items.push((priority, items));
         }
     }
 
-    // Interleave items from all servers with Live TV filtering
-    let mut interleaved_items = Vec::new();
+    // Interleave items from all servers with Live TV filtering. Carry each item's
+    // backend priority so movie dedup can keep the highest-priority copy.
+    let mut interleaved_items: Vec<(crate::models::MediaItem, i32)> = Vec::new();
     let mut live_tv_count = 0;
     let max_items = server_items
         .iter()
-        .map(|items| items.len())
+        .map(|(_, items)| items.len())
         .max()
         .unwrap_or(0);
 
     for i in 0..max_items {
-        for server_item_list in &server_items {
+        for (priority, server_item_list) in &server_items {
             if let Some(item) = server_item_list.get(i) {
                 // Skip additional Live TV items
                 if let Some(collectiontype) = &item.collection_type {
@@ -222,16 +234,24 @@ pub async fn get_items_from_all_servers(
                         }
                     }
                 }
-                interleaved_items.push(item.clone());
+                interleaved_items.push((item.clone(), *priority));
             }
         }
     }
 
+    // Collapse the same movie appearing on multiple backends into one entry.
+    let interleaved_items: Vec<crate::models::MediaItem> = if dedup_movies {
+        dedup_movies_by_provider(interleaved_items)
+    } else {
+        interleaved_items.into_iter().map(|(item, _)| item).collect()
+    };
+
     let count = interleaved_items.len();
     debug!(
-        "Returning {} interleaved items from {} servers",
+        "Returning {} items from {} servers (dedup_movies={})",
         count,
-        server_items.len()
+        server_items.len(),
+        dedup_movies
     );
 
     trace!(
@@ -241,7 +261,7 @@ pub async fn get_items_from_all_servers(
 
     if server_items
         .iter()
-        .any(|items| matches!(items, crate::models::ItemsResponseVariants::WithCount(_)))
+        .any(|(_, items)| matches!(items, crate::models::ItemsResponseVariants::WithCount(_)))
     {
         Ok(Json(crate::models::ItemsResponseVariants::WithCount(
             crate::models::ItemsResponseWithCount {
@@ -254,5 +274,109 @@ pub async fn get_items_from_all_servers(
         Ok(Json(crate::models::ItemsResponseVariants::Bare(
             interleaved_items,
         )))
+    }
+}
+
+/// Ensure the request's `Fields` query includes `ProviderIds` — list views don't
+/// request it by default, but dedup needs it on every item.
+fn ensure_provider_ids_field(req: &mut reqwest::Request) {
+    let mut url = req.url().clone();
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let mut had_fields = false;
+    for (k, v) in pairs.iter_mut() {
+        if k.eq_ignore_ascii_case("fields") {
+            had_fields = true;
+            if !v.to_lowercase().contains("providerids") {
+                v.push_str(",ProviderIds");
+            }
+        }
+    }
+    if !had_fields {
+        pairs.push(("Fields".to_string(), "ProviderIds".to_string()));
+    }
+    url.query_pairs_mut().clear().extend_pairs(pairs.iter());
+    *req.url_mut() = url;
+}
+
+/// A stable dedup key for a movie: the value of its strongest identifying
+/// provider id (Imdb > Tmdb > Tvdb). `None` for non-movies or movies without an
+/// identifying id — those can't be confidently deduped, so they're kept as-is.
+fn movie_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
+    if item.item_type != BaseItemKind::Movie {
+        return None;
+    }
+    let obj = item.provider_ids.as_ref()?.as_object()?;
+    for want in ["imdb", "tmdb", "tvdb"] {
+        for (k, v) in obj {
+            if k.to_lowercase() == want {
+                if let Some(val) = v.as_str() {
+                    return Some(format!("{want}:{val}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Collapse duplicate movies (same provider id across backends) into one entry,
+/// keeping the copy from the highest-priority backend. Position is preserved at
+/// first occurrence; anything that isn't a dedupable movie passes through.
+fn dedup_movies_by_provider(
+    items: Vec<(crate::models::MediaItem, i32)>,
+) -> Vec<crate::models::MediaItem> {
+    use std::collections::HashMap;
+    let mut index_of: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<(crate::models::MediaItem, i32)> = Vec::with_capacity(items.len());
+    for (item, priority) in items {
+        match movie_dedup_key(&item) {
+            Some(key) => match index_of.get(&key) {
+                Some(&idx) => {
+                    // Duplicate: keep the higher-priority backend's copy.
+                    if priority > out[idx].1 {
+                        out[idx] = (item, priority);
+                    }
+                }
+                None => {
+                    index_of.insert(key, out.len());
+                    out.push((item, priority));
+                }
+            },
+            None => out.push((item, priority)),
+        }
+    }
+    out.into_iter().map(|(item, _)| item).collect()
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use crate::models::MediaItem;
+
+    fn movie(id: &str, imdb: Option<&str>) -> MediaItem {
+        let mut m: MediaItem = serde_json::from_value(serde_json::json!({
+            "Id": id, "Type": "Movie",
+        }))
+        .unwrap();
+        if let Some(i) = imdb {
+            m.provider_ids = Some(serde_json::json!({ "Imdb": i }));
+        }
+        m
+    }
+
+    #[test]
+    fn keeps_highest_priority_copy_and_passes_through_rest() {
+        let items = vec![
+            (movie("a-lo", Some("tt1")), 50), // Movies2-ish (lower)
+            (movie("a-hi", Some("tt1")), 100), // Movies (higher)
+            (movie("b", Some("tt2")), 50),     // unique movie
+            (movie("c-noid", None), 50),       // movie w/o provider id -> kept
+        ];
+        let out = dedup_movies_by_provider(items);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        // tt1 collapsed to the priority-100 copy, in tt1's first position
+        assert_eq!(ids, vec!["a-hi", "b", "c-noid"]);
     }
 }

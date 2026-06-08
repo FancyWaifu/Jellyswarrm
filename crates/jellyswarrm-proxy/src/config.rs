@@ -353,6 +353,12 @@ pub struct AppConfig {
     /// couldn't reach a peer when it was offline. Default 60 (min 5).
     #[serde(default = "default_watched_sync_retry_interval_secs")]
     pub watched_sync_retry_interval_secs: u64,
+
+    /// Collapse the same movie appearing on multiple backends (matched by
+    /// ProviderIds) into a single library entry, served from the highest-
+    /// priority backend that has it. Opt-in; default false.
+    #[serde(default)]
+    pub dedup_movies: bool,
 }
 
 fn default_watched_sync_retry_interval_secs() -> u64 {
