@@ -701,8 +701,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .nest(
                 "/Shows",
                 Router::new()
-                    .route("/{item_id}/Seasons", get(handlers::items::get_items))
-                    .route("/{item_id}/Episodes", get(handlers::items::get_items))
+                    .route(
+                        "/{item_id}/Seasons",
+                        get(handlers::federated::get_series_children),
+                    )
+                    .route(
+                        "/{item_id}/Episodes",
+                        get(handlers::federated::get_series_children),
+                    )
                     .route(
                         "/NextUp",
                         get(handlers::federated::get_items_from_all_servers_if_not_restricted),

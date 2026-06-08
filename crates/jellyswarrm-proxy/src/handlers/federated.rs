@@ -268,6 +268,7 @@ async fn get_items_from_all_servers_inner(
     // the merge group for ParentId fan-out), then collapse duplicate movies.
     let interleaved_items: Vec<crate::models::MediaItem> = if dedup_movies {
         let merged = dedup_and_register_views(&state, interleaved_items).await;
+        let merged = dedup_and_register_series(&state, merged).await;
         dedup_movies_by_provider(merged)
     } else {
         interleaved_items.into_iter().map(|(item, _)| item).collect()
@@ -331,12 +332,11 @@ fn ensure_provider_ids_field(req: &mut reqwest::Request) {
 /// A stable dedup key for a movie: the value of its strongest identifying
 /// provider id (Imdb > Tmdb > Tvdb). `None` for non-movies or movies without an
 /// identifying id — those can't be confidently deduped, so they're kept as-is.
-fn movie_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
-    if item.item_type != BaseItemKind::Movie {
-        return None;
-    }
+/// Strongest identifying provider id for an item (Imdb > Tvdb > Tmdb), e.g.
+/// `imdb:tt..`. Used to match the same movie/series across backends.
+fn provider_key(item: &crate::models::MediaItem) -> Option<String> {
     let obj = item.provider_ids.as_ref()?.as_object()?;
-    for want in ["imdb", "tmdb", "tvdb"] {
+    for want in ["imdb", "tvdb", "tmdb"] {
         for (k, v) in obj {
             if k.to_lowercase() == want {
                 if let Some(val) = v.as_str() {
@@ -346,6 +346,67 @@ fn movie_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
         }
     }
     None
+}
+
+fn movie_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
+    if item.item_type != BaseItemKind::Movie {
+        return None;
+    }
+    provider_key(item)
+}
+
+/// Collapse duplicate Series (same provider id across backends) into one entry,
+/// keeping the highest-priority backend's, and register the merge group so that
+/// browsing the series fans episodes/seasons out across the backends it spans
+/// (no content loss for shows split across servers). Non-series pass through.
+async fn dedup_and_register_series(
+    state: &AppState,
+    items: Vec<(crate::models::MediaItem, i32)>,
+) -> Vec<(crate::models::MediaItem, i32)> {
+    use std::collections::HashMap;
+    let mut out: Vec<(crate::models::MediaItem, i32)> = Vec::with_capacity(items.len());
+    let mut canonical_idx: HashMap<String, usize> = HashMap::new();
+    let mut group_members: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+
+    for (item, priority) in items {
+        if item.item_type != BaseItemKind::Series {
+            out.push((item, priority));
+            continue;
+        }
+        let Some(key) = provider_key(&item) else {
+            out.push((item, priority));
+            continue;
+        };
+        let Some(server_id) = state
+            .media_storage
+            .get_media_mapping_with_server(&item.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, s)| s.id)
+        else {
+            out.push((item, priority));
+            continue;
+        };
+        group_members
+            .entry(key.clone())
+            .or_default()
+            .push((server_id, item.id.clone()));
+        match canonical_idx.get(&key) {
+            Some(&idx) if priority <= out[idx].1 => {}
+            Some(&idx) => out[idx] = (item, priority),
+            None => {
+                canonical_idx.insert(key, out.len());
+                out.push((item, priority));
+            }
+        }
+    }
+    for (key, members) in group_members {
+        if let Some(&idx) = canonical_idx.get(&key) {
+            state.view_merge.register(out[idx].0.id.clone(), members);
+        }
+    }
+    out
 }
 
 /// Collapse duplicate movies (same provider id across backends) into one entry,
@@ -375,6 +436,186 @@ fn dedup_movies_by_provider(
         }
     }
     out.into_iter().map(|(item, _)| item).collect()
+}
+
+/// `/Shows/{seriesId}/Seasons` and `/Shows/{seriesId}/Episodes`. If the series
+/// is a merged canonical series, fan its children out across the backends it
+/// spans (so a show split across servers shows ALL its seasons/episodes, and
+/// duplicates collapse); otherwise route to the single owning backend.
+pub async fn get_series_children(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
+    let full_path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let is_episodes = full_path.to_lowercase().ends_with("/episodes");
+    let series_id = shows_series_id(&full_path);
+
+    if state.config.read().await.dedup_movies {
+        if let Some(sid) = series_id {
+            if let Some(members) = state.view_merge.members(&sid) {
+                return fanout_series_children(state, req, members, is_episodes).await;
+            }
+        }
+    }
+    crate::handlers::items::get_items(State(state), req).await
+}
+
+/// The id segment right after `/Shows/`.
+fn shows_series_id(path: &str) -> Option<String> {
+    let segs: Vec<&str> = path.split('/').collect();
+    for i in 0..segs.len() {
+        if segs[i].eq_ignore_ascii_case("Shows") && i + 1 < segs.len() && !segs[i + 1].is_empty() {
+            return Some(segs[i + 1].to_string());
+        }
+    }
+    None
+}
+
+fn set_shows_series_id(req: &mut reqwest::Request, new_id: &str) {
+    let mut url = req.url().clone();
+    let mut segs: Vec<String> = url.path().split('/').map(String::from).collect();
+    for i in 0..segs.len() {
+        if segs[i].eq_ignore_ascii_case("Shows") && i + 1 < segs.len() {
+            segs[i + 1] = new_id.to_string();
+            break;
+        }
+    }
+    url.set_path(&segs.join("/"));
+    // A canonical season id is meaningless on peer backends — drop the filter and
+    // dedup by season+episode number instead.
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("seasonId"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(pairs.iter());
+    *req.url_mut() = url;
+}
+
+async fn fanout_series_children(
+    state: AppState,
+    req: Request,
+    members: Vec<(i64, String)>,
+    is_episodes: bool,
+) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
+    use std::collections::HashMap;
+    let member_map: HashMap<i64, String> = members.into_iter().collect();
+    let (original_request, _, _, sessions, _) = extract_request_infos(req, &state).await.map_err(|e| {
+        error!("series fanout preprocess: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    let sessions = sessions.ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let mut join_set = JoinSet::new();
+    for (session, server) in sessions {
+        let Some(backend_series_id) = member_map.get(&server.id).cloned() else {
+            continue;
+        };
+        if state.backend_health.is_ejected(server.id).await {
+            continue;
+        }
+        let Some(mut request) = original_request.try_clone() else {
+            continue;
+        };
+        set_shows_series_id(&mut request, &backend_series_id);
+        let auth = JellyfinAuthorization::Authorization(session.to_authorization());
+        let state_c = state.clone();
+        join_set.spawn(async move {
+            apply_to_request(&mut request, &server, &Some(session), &Some(auth), &state_c).await;
+            let call = execute_json_request::<crate::models::ItemsResponseVariants>(
+                &state_c.reqwest_client,
+                request,
+            );
+            match tokio::time::timeout(DEFAULT_BACKEND_TIMEOUT, call).await {
+                Ok(Ok(mut resp)) => {
+                    let sid = { state_c.config.read().await.server_id.clone() };
+                    for item in resp.iter_mut_items() {
+                        if let Ok(p) =
+                            process_media_item(item.clone(), &state_c, &server, true, &sid).await
+                        {
+                            *item = p;
+                        }
+                    }
+                    Some((server.priority, resp))
+                }
+                _ => None,
+            }
+        });
+    }
+
+    let mut collected: Vec<(crate::models::MediaItem, i32)> = Vec::new();
+    while let Some(r) = join_set.join_next().await {
+        if let Ok(Some((priority, resp))) = r {
+            for item in resp_into_items(resp) {
+                collected.push((item, priority));
+            }
+        }
+    }
+    let items = dedup_children_by_number(collected, is_episodes);
+    let count = items.len() as i32;
+    Ok(Json(crate::models::ItemsResponseVariants::WithCount(
+        crate::models::ItemsResponseWithCount {
+            items,
+            total_record_count: count,
+            start_index: 0,
+        },
+    )))
+}
+
+fn resp_into_items(resp: crate::models::ItemsResponseVariants) -> Vec<crate::models::MediaItem> {
+    match resp {
+        crate::models::ItemsResponseVariants::WithCount(w) => w.items,
+        crate::models::ItemsResponseVariants::Bare(v) => v,
+    }
+}
+
+/// Dedup seasons (by season number) or episodes (by season+episode number),
+/// keeping the highest-priority backend's copy. Items without numbers pass through.
+fn dedup_children_by_number(
+    items: Vec<(crate::models::MediaItem, i32)>,
+    is_episodes: bool,
+) -> Vec<crate::models::MediaItem> {
+    use std::collections::HashMap;
+    let num = |it: &crate::models::MediaItem, k: &str| -> Option<i64> {
+        it.extra.get(k).and_then(|v| v.as_i64())
+    };
+    let mut idx_of: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut out: Vec<(crate::models::MediaItem, i32)> = Vec::with_capacity(items.len());
+    for (item, priority) in items {
+        let key = if is_episodes {
+            match (num(&item, "ParentIndexNumber"), num(&item, "IndexNumber")) {
+                (Some(s), Some(e)) => Some((s, e)),
+                _ => None,
+            }
+        } else {
+            num(&item, "IndexNumber").map(|s| (s, -1))
+        };
+        match key {
+            Some(k) => match idx_of.get(&k) {
+                Some(&i) => {
+                    if priority > out[i].1 {
+                        out[i] = (item, priority);
+                    }
+                }
+                None => {
+                    idx_of.insert(k, out.len());
+                    out.push((item, priority));
+                }
+            },
+            None => out.push((item, priority)),
+        }
+    }
+    // Order seasons/episodes by their number for a sensible display.
+    out.sort_by_key(|(it, _)| {
+        let s = num(it, if is_episodes { "ParentIndexNumber" } else { "IndexNumber" }).unwrap_or(0);
+        let e = if is_episodes { num(it, "IndexNumber").unwrap_or(0) } else { 0 };
+        (s, e)
+    });
+    out.into_iter().map(|(it, _)| it).collect()
 }
 
 /// Replace (or add) the `ParentId` query param on a backend request.
