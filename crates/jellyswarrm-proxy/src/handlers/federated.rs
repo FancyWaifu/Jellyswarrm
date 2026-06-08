@@ -407,6 +407,36 @@ fn movie_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
     provider_key(item)
 }
 
+/// A cross-backend dedup key for an Episode appearing in an aggregated row
+/// (Continue Watching / Next Up / Latest). Since cross-server sync now mirrors an
+/// episode's watch state to every backend, the same episode surfaces once per
+/// backend in those rows; collapse them. Prefer the episode's own provider id;
+/// otherwise fall back to its (series, season, episode) identity.
+fn episode_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
+    if item.item_type != BaseItemKind::Episode {
+        return None;
+    }
+    if let Some(k) = provider_key(item) {
+        return Some(format!("ep#{k}"));
+    }
+    let series = strip_server_suffix(item.series_name.as_deref()?);
+    if series.is_empty() {
+        return None;
+    }
+    let season = item.extra.get("ParentIndexNumber").and_then(|v| v.as_i64());
+    let episode = item.extra.get("IndexNumber").and_then(|v| v.as_i64());
+    match (season, episode) {
+        (Some(s), Some(e)) => Some(format!("ep#{}|s{s}e{e}", series.to_lowercase())),
+        _ => None,
+    }
+}
+
+/// The dedup key for a "leaf" item (a Movie or an Episode), used to collapse the
+/// same title appearing on multiple backends in an aggregated list.
+fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
+    movie_dedup_key(item).or_else(|| episode_dedup_key(item))
+}
+
 /// Collapse duplicate Series (same provider id across backends) into one entry,
 /// keeping the highest-priority backend's, and register the merge group so that
 /// browsing the series fans episodes/seasons out across the backends it spans
@@ -461,9 +491,10 @@ async fn dedup_and_register_series(
     out
 }
 
-/// Collapse duplicate movies (same provider id across backends) into one entry,
-/// keeping the copy from the highest-priority backend. Position is preserved at
-/// first occurrence; anything that isn't a dedupable movie passes through.
+/// Collapse duplicate leaf items — movies and episodes that are the same title
+/// across backends — into one entry, keeping the copy from the highest-priority
+/// backend. Position is preserved at first occurrence; anything without a leaf
+/// key (series, folders, …) passes through untouched.
 fn dedup_movies_by_provider(
     items: Vec<(crate::models::MediaItem, i32)>,
 ) -> Vec<crate::models::MediaItem> {
@@ -471,7 +502,7 @@ fn dedup_movies_by_provider(
     let mut index_of: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<(crate::models::MediaItem, i32)> = Vec::with_capacity(items.len());
     for (item, priority) in items {
-        match movie_dedup_key(&item) {
+        match leaf_dedup_key(&item) {
             Some(key) => match index_of.get(&key) {
                 Some(&idx) => {
                     // Duplicate: keep the higher-priority backend's copy.
@@ -1042,5 +1073,29 @@ mod dedup_tests {
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
         // tt1 collapsed to the priority-100 copy, in tt1's first position
         assert_eq!(ids, vec!["a-hi", "b", "c-noid"]);
+    }
+
+    fn episode(id: &str, series: &str, season: i64, ep: i64) -> MediaItem {
+        let mut m: MediaItem = serde_json::from_value(serde_json::json!({
+            "Id": id, "Type": "Episode", "SeriesName": series,
+            "ParentIndexNumber": season, "IndexNumber": ep,
+        }))
+        .unwrap();
+        m.series_name = Some(series.to_string());
+        m
+    }
+
+    #[test]
+    fn dedups_same_episode_across_backends_in_aggregated_row() {
+        // Same episode (no episode-level provider id) on two backends, tagged with
+        // the proxy's [server] suffix — must collapse by series+season+episode.
+        let items = vec![
+            (episode("ep-whiskey", "Desmond's [Whiskey jellyfin]", 1, 3), 100),
+            (episode("ep-stephans", "Desmond's [Stephans jellyfin]", 1, 3), 50),
+            (episode("other", "Desmond's [Whiskey jellyfin]", 1, 4), 50), // diff episode -> kept
+        ];
+        let out = dedup_movies_by_provider(items);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["ep-whiskey", "other"]);
     }
 }
