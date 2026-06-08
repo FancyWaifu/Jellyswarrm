@@ -437,18 +437,58 @@ fn episode_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
 /// provider-less items (e.g. episodes imported as movies in a mixed-content
 /// "Media" library, with no metadata) still collapse when their filenames match.
 fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
-    if !matches!(
-        item.item_type,
-        BaseItemKind::Movie | BaseItemKind::Episode
-    ) {
-        return None;
+    use BaseItemKind::*;
+    // Normalized, suffix-stripped title.
+    let title = || -> Option<String> {
+        let n = strip_server_suffix(item.name.as_deref()?).trim().to_lowercase();
+        (!n.is_empty()).then_some(n)
+    };
+    let extra_lc = |k: &str| -> String {
+        item.extra
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default()
+    };
+    match item.item_type {
+        Movie => movie_dedup_key(item).or_else(|| title().map(|n| format!("mv#{n}"))),
+        Episode => episode_dedup_key(item).or_else(|| title().map(|n| format!("ep#{n}"))),
+        // Music + home-video leaf types: cross-server copies of the same track /
+        // video weren't deduped (only movies & episodes were), so they doubled up
+        // in "Recently Added" etc. Match by provider id, else type + artist +
+        // album + title (artist/album keep distinct same-titled tracks apart).
+        Audio | AudioBook | MusicVideo | MusicAlbum | Video | Trailer => {
+            if let Some(k) = provider_key(item) {
+                return Some(format!("{:?}#{k}", item.item_type));
+            }
+            let title = title()?;
+            let artist = {
+                let a = extra_lc("AlbumArtist");
+                if a.is_empty() {
+                    item.extra
+                        .get("Artists")
+                        .and_then(|x| x.as_array())
+                        .and_then(|x| x.first())
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default()
+                } else {
+                    a
+                }
+            };
+            let album = extra_lc("Album");
+            // Track/disc number keeps two distinct same-titled tracks apart while
+            // still collapsing the SAME track across backends (same number).
+            let track = item
+                .extra
+                .get("IndexNumber")
+                .and_then(|v| v.as_i64())
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            Some(format!("{:?}#{artist}|{album}|{track}|{title}", item.item_type))
+        }
+        _ => None,
     }
-    movie_dedup_key(item)
-        .or_else(|| episode_dedup_key(item))
-        .or_else(|| {
-            let name = strip_server_suffix(item.name.as_deref()?).trim().to_lowercase();
-            (!name.is_empty()).then(|| format!("name#{name}"))
-        })
 }
 
 /// Collapse duplicate Series (same provider id across backends) into one entry,
@@ -1146,6 +1186,27 @@ mod dedup_tests {
         let out = dedup_movies_by_provider(vec![(a, 100), (b, 50), (c, 50)]);
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn dedups_music_across_backends_but_keeps_distinct_tracks() {
+        let audio = |id: &str, name: &str, artist: &str, album: &str| -> MediaItem {
+            let mut m: MediaItem = serde_json::from_value(serde_json::json!({
+                "Id": id, "Type": "Audio", "AlbumArtist": artist, "Album": album,
+            }))
+            .unwrap();
+            m.name = Some(name.to_string());
+            m
+        };
+        let items = vec![
+            (audio("a", "Today [Whiskey jellyfin]", "Smashing Pumpkins", "Gish"), 100),
+            (audio("b", "Today [Paw jellyfin]", "Smashing Pumpkins", "Gish"), 50), // dup
+            (audio("c", "Today [Whiskey jellyfin]", "Willow", "Today"), 50),       // diff artist -> kept
+            (audio("d", "Heart-Shaped Box [Whiskey jellyfin]", "Nirvana", "In Utero"), 50),
+        ];
+        let out = dedup_movies_by_provider(items);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c", "d"]);
     }
 
     fn episode(id: &str, series: &str, season: i64, ep: i64) -> MediaItem {
