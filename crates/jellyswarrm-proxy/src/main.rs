@@ -958,11 +958,11 @@ async fn proxy_handler(
     // (item id in the path), and playback stop/pause (item id in the body, read
     // after id-mapping further down). The fan-out re-reads the source item's full
     // UserData, so all we capture here is which item changed.
-    let sync_src = preprocessed
-        .session
-        .as_ref()
-        .map(|src| (preprocessed.server.clone(), src.clone()));
+    let sync_user_id = preprocessed.session.as_ref().map(|s| s.user_id.clone());
+    let routed_server_id = preprocessed.server.id;
     let method = preprocessed.request.method().clone();
+    // Played/favorite carry the (already id-mapped) item in the path, and the route
+    // followed that item, so the routed backend owns it.
     let path_item: Option<String> = if matches!(
         method,
         reqwest::Method::POST | reqwest::Method::DELETE
@@ -976,13 +976,31 @@ async fn proxy_handler(
     let is_playing_report = method == reqwest::Method::POST
         && watched_sync::is_playing_report_path(request_url.path());
     let playing_is_stopped = request_url.path().trim_end_matches('/').ends_with("/Stopped");
-    let mut playing_item: Option<String> = None;
+    // For playback reports we capture the *virtual* ItemId from the body (below)
+    // and resolve its owning backend ourselves — the request may be routed to a
+    // different backend (a version-picker source), so we can't trust the route.
+    let mut playing_item_virtual: Option<String> = None;
 
     let payload_processing_context = RequestProcessingContext::new(&preprocessed);
     let mut request = preprocessed.request;
 
     let preprocessor = &state.processors.request_processor;
     if let Some(mut json_value) = body_to_json(&request) {
+        // Playback report: sync only on stop or pause (not every running tick).
+        // Capture the *virtual* ItemId from the original body (before id-mapping)
+        // so we can resolve its true owning backend, not the routed one.
+        if is_playing_report {
+            let paused = json_value
+                .get("IsPaused")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if playing_is_stopped || paused {
+                playing_item_virtual = json_value
+                    .get("ItemId")
+                    .and_then(|i| i.as_str())
+                    .map(str::to_string);
+            }
+        }
         let response =
             processors::process_json(&mut json_value, preprocessor, &payload_processing_context)
                 .await
@@ -990,22 +1008,6 @@ async fn proxy_handler(
                     error!("Failed to process JSON body: {}", e);
                     StatusCode::BAD_REQUEST
                 })?;
-        // Playback report: sync only on stop or pause (not every running tick),
-        // pulling the now-id-mapped backend ItemId from the processed body.
-        if is_playing_report {
-            let paused = response
-                .data
-                .get("IsPaused")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
-            if playing_is_stopped || paused {
-                playing_item = response
-                    .data
-                    .get("ItemId")
-                    .and_then(|i| i.as_str())
-                    .map(str::to_string);
-            }
-        }
         if response.was_modified {
             debug!("Modified JSON body for request to {}", request_url);
             let new_body = serde_json::to_vec(&response.data).map_err(|e| {
@@ -1034,16 +1036,36 @@ async fn proxy_handler(
     } else if state.config.read().await.watched_state_sync {
         // A path trigger (played/favorite) or a playback stop/pause — fan the
         // source item's UserData out to the user's other backends.
-        if let (Some((src_server, src_session)), Some(item_id)) =
-            (sync_src, path_item.or(playing_item))
-        {
-            tokio::spawn(watched_sync::fan_out(
-                state.watched_sync_queue.clone(),
-                state.user_authorization.clone(),
-                src_server,
-                src_session,
-                item_id,
-            ));
+        if let Some(user_id) = sync_user_id {
+            let source: Option<(i64, String)> = if let Some(real_item) = path_item {
+                // Played/favorite: the route followed the item, so the routed
+                // backend owns it.
+                Some((routed_server_id, real_item))
+            } else if let Some(virtual_item) = playing_item_virtual {
+                // Playback report: resolve the item's true owner from its mapping.
+                match state
+                    .media_storage
+                    .get_media_mapping_with_server(&virtual_item)
+                    .await
+                {
+                    Ok(Some((mapping, server))) => Some((server.id, mapping.original_media_id)),
+                    _ => {
+                        debug!("sync: no media mapping for played item {virtual_item}; skipping");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some((source_server_id, source_item_id)) = source {
+                tokio::spawn(watched_sync::fan_out(
+                    state.watched_sync_queue.clone(),
+                    state.user_authorization.clone(),
+                    user_id,
+                    source_server_id,
+                    source_item_id,
+                ));
+            }
         }
     }
     let headers = response.headers().clone();

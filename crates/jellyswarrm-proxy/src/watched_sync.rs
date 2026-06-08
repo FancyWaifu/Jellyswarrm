@@ -61,30 +61,44 @@ async fn backend_client(server: &Server, token: &str) -> Option<JellyfinClient> 
 
 /// Propagate an item's current UserData from the source backend to every other
 /// backend the user is mapped to. Spawned detached. Peers that fail are queued
-/// for retry; peers that succeed clear any stale queue entry. `source_item_id`
-/// is the source backend's *own* item id (the proxy resolves it before this).
+/// for retry; peers that succeed clear any stale queue entry.
+///
+/// `source_server_id` is the backend that OWNS `source_item_id` (the caller
+/// resolves it from the item's own media mapping). Resolving the source by item
+/// owner — rather than by whichever backend the request happened to be routed to
+/// — keeps the source read consistent even when the request was routed elsewhere
+/// (e.g. a version-picker source on a different backend than the item's owner).
 pub async fn fan_out(
     queue: Arc<WatchedSyncQueue>,
     user_auth: Arc<UserAuthorizationService>,
-    source_server: Server,
-    source_session: AuthorizationSession,
+    user_id: String,
+    source_server_id: i64,
     source_item_id: String,
 ) {
-    // Peers = the user's OTHER backends. Use the *full* session list (NOT the
-    // request's ejected-filtered one) and dedupe to one session per server, so a
-    // peer that's down/ejected right now still gets queued for retry.
-    let all = match user_auth
-        .get_user_sessions_by_user_id(&source_session.user_id)
-        .await
-    {
+    // Use the *full* session list (NOT the request's ejected-filtered one) and
+    // dedupe to one session per server, so a peer that's down/ejected right now
+    // still gets queued for retry. Split into the source (its owner) and peers.
+    let all = match user_auth.get_user_sessions_by_user_id(&user_id).await {
         Ok(Some((_, s))) => s,
         _ => return,
     };
     let mut seen = std::collections::HashSet::new();
-    let peers: Vec<(AuthorizationSession, Server)> = all
-        .into_iter()
-        .filter(|(_, server)| server.id != source_server.id && seen.insert(server.id))
-        .collect();
+    let mut source: Option<(AuthorizationSession, Server)> = None;
+    let mut peers: Vec<(AuthorizationSession, Server)> = Vec::new();
+    for (session, server) in all {
+        if !seen.insert(server.id) {
+            continue;
+        }
+        if server.id == source_server_id {
+            source = Some((session, server));
+        } else {
+            peers.push((session, server));
+        }
+    }
+    let Some((source_session, source_server)) = source else {
+        warn!("sync: no session on source backend {source_server_id}; can't read source item");
+        return;
+    };
     if peers.is_empty() {
         return;
     }
@@ -105,7 +119,10 @@ pub async fn fan_out(
         }
         Ok(pair) => pair,
         Err(e) => {
-            warn!("sync: couldn't read source item: {e}");
+            warn!(
+                "sync: couldn't read source item {source_item_id} on '{}' (backend user {}): {e}",
+                source_server.name, source_session.original_user_id
+            );
             return;
         }
     };
