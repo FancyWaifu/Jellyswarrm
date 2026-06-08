@@ -573,7 +573,39 @@ fn shows_series_id(path: &str) -> Option<String> {
     None
 }
 
-fn set_shows_series_id(req: &mut reqwest::Request, new_id: &str) {
+/// If the request carries a `seasonId` (a canonical season virtual id), resolve
+/// it to that season's NUMBER by reading the season item from its owning backend.
+/// Returns `None` when there's no season filter (the client asked for the whole
+/// series) or it can't be resolved.
+async fn season_filter_number(
+    state: &AppState,
+    request: &reqwest::Request,
+    sessions: &[(AuthorizationSession, Server)],
+) -> Option<i64> {
+    let season_id = request
+        .url()
+        .query_pairs()
+        .find(|(k, _)| k.eq_ignore_ascii_case("seasonId"))
+        .map(|(_, v)| v.into_owned())?;
+    let (mapping, server) = state
+        .media_storage
+        .get_media_mapping_with_server(&season_id)
+        .await
+        .ok()
+        .flatten()?;
+    let (session, srv) = sessions.iter().find(|(_, s)| s.id == server.id)?;
+    let client =
+        jellyfin_api::JellyfinClient::new(srv.url.as_str(), crate::config::CLIENT_INFO.clone())
+            .ok()?;
+    client.with_token(session.jellyfin_token.clone()).await;
+    client
+        .get_item_index_number(&session.original_user_id, &mapping.original_media_id)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn set_shows_series_id(req: &mut reqwest::Request, new_id: &str, season_number: Option<i64>) {
     let mut url = req.url().clone();
     let mut segs: Vec<String> = url.path().split('/').map(String::from).collect();
     for i in 0..segs.len() {
@@ -583,13 +615,18 @@ fn set_shows_series_id(req: &mut reqwest::Request, new_id: &str) {
         }
     }
     url.set_path(&segs.join("/"));
-    // A canonical season id is meaningless on peer backends — drop the filter and
-    // dedup by season+episode number instead.
-    let pairs: Vec<(String, String)> = url
+    // A canonical `seasonId` is meaningless on peer backends. Drop it; if the
+    // client asked for a specific season, translate it to the universal `season`
+    // (number) filter so every backend returns ONLY that season's episodes —
+    // otherwise a backend returns the whole series and seasons get jumbled.
+    let mut pairs: Vec<(String, String)> = url
         .query_pairs()
-        .filter(|(k, _)| !k.eq_ignore_ascii_case("seasonId"))
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("seasonId") && !k.eq_ignore_ascii_case("season"))
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
+    if let Some(n) = season_number {
+        pairs.push(("season".to_string(), n.to_string()));
+    }
     url.query_pairs_mut().clear().extend_pairs(pairs.iter());
     *req.url_mut() = url;
 }
@@ -605,6 +642,12 @@ async fn fanout_series_children(
         StatusCode::BAD_REQUEST
     })?;
     let sessions = sessions.ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // If the client asked for a specific season (by the canonical `seasonId`),
+    // translate it to that season's NUMBER so every backend can be filtered to it
+    // (a backend doesn't recognise another's season id). Without this each backend
+    // returns the whole series and the seasons get jumbled together.
+    let season_number = season_filter_number(&state, &original_request, &sessions).await;
 
     // One request per member (server, backend series id). A merged series can span
     // several libraries on the same backend, so a server may be queried more than
@@ -622,7 +665,7 @@ async fn fanout_series_children(
         let Some(mut request) = original_request.try_clone() else {
             continue;
         };
-        set_shows_series_id(&mut request, &backend_series_id);
+        set_shows_series_id(&mut request, &backend_series_id, season_number);
         let auth = JellyfinAuthorization::Authorization(session.to_authorization());
         let state_c = state.clone();
         join_set.spawn(async move {

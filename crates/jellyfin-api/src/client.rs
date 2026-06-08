@@ -323,6 +323,17 @@ impl JellyfinClient {
         Ok((MatchKey::Provider(providers_from(v.get("ProviderIds"))), user_data))
     }
 
+    /// An item's `IndexNumber` (e.g. a Season's number), or `None` if absent.
+    pub async fn get_item_index_number(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<Option<i64>, Error> {
+        let path = format!("Users/{user_id}/Items/{item_id}");
+        let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+        Ok(v.get("IndexNumber").and_then(|n| n.as_i64()))
+    }
+
     /// Resolve "the same title" on this backend for a [`MatchKey`] → its item id,
     /// or `None` if this backend doesn't have it. Movies/series match by provider
     /// id; episodes resolve the series by provider id then match season+episode.
