@@ -3,4 +3,4 @@ pub mod error;
 pub mod models;
 pub mod storage;
 
-pub use client::{ClientInfo, JellyfinClient};
+pub use client::{ClientInfo, ItemUserData, JellyfinClient, MatchKey};

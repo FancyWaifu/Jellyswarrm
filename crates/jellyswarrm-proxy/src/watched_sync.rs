@@ -1,19 +1,21 @@
-//! Cross-server watched-state sync.
+//! Cross-server playback-state sync.
 //!
-//! When a user marks an item played/unplayed on one backend, propagate that to
-//! the *same title* (matched by `ProviderIds`) on their other backends. Watching
-//! *Night of the Living Dead* on backend A also marks the copy on backend B.
+//! When a user's per-item state changes on one backend — marked played/unplayed,
+//! favorited, or playback stopped/paused — propagate the item's UserData (resume
+//! position, played, play count, favorite, last-played) to the *same title* on
+//! their other backends. The cross-backend join key is the item's provider id
+//! (movies/series) or its series' provider id + season/episode (episodes), so
+//! e.g. pausing *The Matrix* on backend A leaves your resume point on backend B.
 //!
-//! v1 scope: movies, played/unplayed only. The fan-out is best-effort and runs
-//! detached from the user's request. Peers that are offline/ejected at mark time
-//! are queued ([`WatchedSyncQueue`]) and drained by a background retry loop once
-//! they recover, so a transient outage doesn't silently drop the change.
+//! The fan-out is best-effort and runs detached from the user's request. Peers
+//! offline/ejected at the time are queued ([`WatchedSyncQueue`]) and drained by a
+//! background retry loop once they recover, so a transient outage isn't dropped.
 
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use jellyfin_api::JellyfinClient;
+use jellyfin_api::{ItemUserData, JellyfinClient, MatchKey};
 use moka::future::Cache;
 use sqlx::{Row, SqlitePool};
 use tracing::{debug, info, warn};
@@ -26,10 +28,10 @@ use crate::user_authorization_service::{AuthorizationSession, UserAuthorizationS
 /// Stop retrying after ~this many attempts (≈ attempts × interval of wall-clock).
 const MAX_RETRY_ATTEMPTS: i64 = 60;
 
-/// `(peer server id, "imdb.tt..,tmdb..")` -> the peer's item id (or `None` when
-/// the peer genuinely has no matching title). 1h TTL. Only *successful* lookups
-/// are cached — a failed lookup (peer down) must NOT poison this with a false
-/// "no match", or a recovered peer would be skipped for up to an hour.
+/// `(peer server id, match cache-key)` -> the peer's item id (or `None` when the
+/// peer genuinely has no matching title). 1h TTL. Only *successful* lookups are
+/// cached — a failed lookup (peer down) must NOT poison this with a false "no
+/// match", or a recovered peer would be skipped for up to an hour.
 static ITEM_MATCH_CACHE: LazyLock<Cache<(i64, String), Option<String>>> = LazyLock::new(|| {
     Cache::builder()
         .max_capacity(10_000)
@@ -40,7 +42,7 @@ static ITEM_MATCH_CACHE: LazyLock<Cache<(i64, String), Option<String>>> = LazyLo
 /// Outcome of trying to sync one peer — drives the retry queue.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PeerOutcome {
-    /// Played state set on the peer.
+    /// UserData applied on the peer.
     Synced,
     /// Peer doesn't have this title (authoritative "nothing to do").
     NoMatch,
@@ -51,22 +53,22 @@ enum PeerOutcome {
 /// Build a token-authenticated client for one backend.
 async fn backend_client(server: &Server, token: &str) -> Option<JellyfinClient> {
     let client = JellyfinClient::new(server.url.as_str(), CLIENT_INFO.clone())
-        .map_err(|e| warn!("watched-sync: bad client for '{}': {}", server.name, e))
+        .map_err(|e| warn!("sync: bad client for '{}': {}", server.name, e))
         .ok()?;
     client.with_token(token.to_string()).await;
     Some(client)
 }
 
-/// Propagate a played/unplayed change from the source backend to every other
+/// Propagate an item's current UserData from the source backend to every other
 /// backend the user is mapped to. Spawned detached. Peers that fail are queued
-/// for retry; peers that succeed clear any stale queue entry.
+/// for retry; peers that succeed clear any stale queue entry. `source_item_id`
+/// is the source backend's *own* item id (the proxy resolves it before this).
 pub async fn fan_out(
     queue: Arc<WatchedSyncQueue>,
     user_auth: Arc<UserAuthorizationService>,
     source_server: Server,
     source_session: AuthorizationSession,
     source_item_id: String,
-    played: bool,
 ) {
     // Peers = the user's OTHER backends. Use the *full* session list (NOT the
     // request's ejected-filtered one) and dedupe to one session per server, so a
@@ -87,35 +89,33 @@ pub async fn fan_out(
         return;
     }
 
-    // Resolve the source item's ProviderIds (the cross-backend join key) AND its
-    // *current* played state. Re-reading the authoritative source state makes
-    // rapid play/unplay toggles converge regardless of task ordering.
+    // Read the source item's match key + current UserData. Re-reading the
+    // authoritative source state makes rapid changes converge regardless of task
+    // ordering, and captures play count / last-played the backend just computed.
     let Some(src) = backend_client(&source_server, &source_session.jellyfin_token).await else {
         return;
     };
-    let (provider_ids, source_played) = match src
-        .get_item_match_info(&source_session.original_user_id, &source_item_id)
+    let (match_key, user_data) = match src
+        .get_item_sync_info(&source_session.original_user_id, &source_item_id)
         .await
     {
-        Ok((p, _)) if p.is_empty() => {
-            debug!("watched-sync: item {source_item_id} has no ProviderIds; nothing to match on");
+        Ok((key, _)) if key.is_empty() => {
+            debug!("sync: item {source_item_id} has no identifying ids; nothing to match on");
             return;
         }
-        Ok((p, played)) => (p, played),
+        Ok(pair) => pair,
         Err(e) => {
-            warn!("watched-sync: couldn't read source item: {e}");
+            warn!("sync: couldn't read source item: {e}");
             return;
         }
     };
-    let played = source_played.unwrap_or(played);
-    let provider_vec: Vec<(String, String)> = provider_ids.into_iter().collect();
-    let title_key = title_key(&provider_vec);
+    let title_key = match_key.cache_key();
 
     // Fan out to each peer backend.
     for (session, server) in peers {
         let outcome = tokio::time::timeout(
             DEFAULT_BACKEND_TIMEOUT,
-            sync_one_peer(&session, &server, &provider_vec, &title_key, played),
+            sync_one_peer(&session, &server, &match_key, &title_key, &user_data),
         )
         .await
         .unwrap_or(PeerOutcome::Failed);
@@ -125,9 +125,9 @@ pub async fn fan_out(
                 queue.remove(&session.user_id, server.id, &title_key).await;
             }
             PeerOutcome::Failed => {
-                warn!("watched-sync: '{}' unreachable; queued for retry", server.name);
+                warn!("sync: '{}' unreachable; queued for retry", server.name);
                 queue
-                    .enqueue(&session.user_id, server.id, &title_key, &provider_vec, played)
+                    .enqueue(&session.user_id, server.id, &title_key, &match_key, &user_data)
                     .await;
             }
         }
@@ -137,9 +137,9 @@ pub async fn fan_out(
 async fn sync_one_peer(
     session: &AuthorizationSession,
     server: &Server,
-    provider_vec: &[(String, String)],
+    match_key: &MatchKey,
     title_key: &str,
-    played: bool,
+    user_data: &ItemUserData,
 ) -> PeerOutcome {
     let Some(client) = backend_client(server, &session.jellyfin_token).await else {
         return PeerOutcome::Failed;
@@ -151,7 +151,7 @@ async fn sync_one_peer(
     let peer_item_id = match ITEM_MATCH_CACHE.get(&cache_key).await {
         Some(cached) => cached,
         None => match client
-            .find_item_id_by_provider_ids(&session.original_user_id, provider_vec)
+            .find_item_by_match(&session.original_user_id, match_key)
             .await
         {
             Ok(found) => {
@@ -159,55 +159,65 @@ async fn sync_one_peer(
                 found
             }
             Err(e) => {
-                warn!("watched-sync: lookup on '{}' failed: {}", server.name, e);
+                warn!("sync: lookup on '{}' failed: {}", server.name, e);
                 return PeerOutcome::Failed;
             }
         },
     };
 
     let Some(peer_item_id) = peer_item_id else {
-        debug!("watched-sync: '{}' has no match for {title_key}", server.name);
+        debug!("sync: '{}' has no match for {title_key}", server.name);
         return PeerOutcome::NoMatch;
     };
 
     match client
-        .set_played(&session.original_user_id, &peer_item_id, played)
+        .apply_user_data(&session.original_user_id, &peer_item_id, user_data)
         .await
     {
         Ok(()) => {
             info!(
-                "watched-sync: set played={played} on '{}' (item {peer_item_id})",
-                server.name
+                "sync: applied userdata (played={}, pos={}, fav={}) on '{}' (item {peer_item_id})",
+                user_data.played, user_data.playback_position_ticks, user_data.is_favorite, server.name
             );
             PeerOutcome::Synced
         }
         Err(e) => {
-            warn!("watched-sync: set played on '{}' failed: {}", server.name, e);
+            warn!("sync: apply userdata on '{}' failed: {}", server.name, e);
             PeerOutcome::Failed
         }
     }
 }
 
-/// Stable per-title key: sorted, lowercased `key.value` provider pairs.
-fn title_key(provider_vec: &[(String, String)]) -> String {
-    let mut keyed: Vec<String> = provider_vec
-        .iter()
-        .map(|(k, v)| format!("{}.{}", k.to_lowercase(), v))
-        .collect();
-    keyed.sort();
-    keyed.join(",")
-}
-
-/// Parse `/Users/{user_id}/PlayedItems/{item_id}` -> `item_id`. Returns `None`
-/// for any other path so the hook only fires on mark-played/unplayed.
-pub fn played_item_id_from_path(path: &str) -> Option<&str> {
+/// Parse `/Users/{user_id}/{segment}/{item_id}` -> `item_id` for a given action
+/// segment (e.g. `PlayedItems`, `FavoriteItems`). `None` for any other path.
+fn user_action_item_id<'a>(path: &'a str, segment: &str) -> Option<&'a str> {
     let rest = path.strip_prefix("/Users/")?;
     let (_user, rest) = rest.split_once('/')?;
-    let item = rest.strip_prefix("PlayedItems/")?;
+    let item = rest.strip_prefix(segment)?.strip_prefix('/')?;
     if item.is_empty() || item.contains('/') {
         return None;
     }
     Some(item)
+}
+
+/// `/Users/{id}/PlayedItems/{itemId}` -> item id (mark played/unplayed hook).
+pub fn played_item_id_from_path(path: &str) -> Option<&str> {
+    user_action_item_id(path, "PlayedItems")
+}
+
+/// `/Users/{id}/FavoriteItems/{itemId}` -> item id (favorite/unfavorite hook).
+pub fn favorite_item_id_from_path(path: &str) -> Option<&str> {
+    user_action_item_id(path, "FavoriteItems")
+}
+
+/// Whether a path is a playback progress/stop report whose body carries the
+/// played item id (`/Sessions/Playing`, `/Sessions/Playing/Progress`,
+/// `/Sessions/Playing/Stopped`). The caller pulls `ItemId` from the JSON body.
+pub fn is_playing_report_path(path: &str) -> bool {
+    matches!(
+        path.trim_end_matches('/'),
+        "/Sessions/Playing" | "/Sessions/Playing/Progress" | "/Sessions/Playing/Stopped"
+    )
 }
 
 // ===================== persistent retry queue =====================
@@ -223,8 +233,8 @@ struct QueueEntry {
     user_id: String,
     server_id: i64,
     title_key: String,
-    provider_ids: Vec<(String, String)>,
-    played: bool,
+    match_key: MatchKey,
+    user_data: ItemUserData,
 }
 
 impl WatchedSyncQueue {
@@ -232,40 +242,40 @@ impl WatchedSyncQueue {
         Self { pool }
     }
 
-    /// Queue (or refresh) a pending change. Deduped per (user, server, title):
-    /// a newer intent overwrites the old one and resets the attempt counter.
+    /// Queue (or refresh) a pending sync. Deduped per (user, server, title): a
+    /// newer intent overwrites the old one and resets the attempt counter.
     async fn enqueue(
         &self,
         user_id: &str,
         server_id: i64,
         title_key: &str,
-        provider_ids: &[(String, String)],
-        played: bool,
+        match_key: &MatchKey,
+        user_data: &ItemUserData,
     ) {
-        let json = match serde_json::to_string(provider_ids) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!("watched-sync: can't serialize provider ids: {e}");
-                return;
-            }
+        let (Ok(mk), Ok(ud)) = (
+            serde_json::to_string(match_key),
+            serde_json::to_string(user_data),
+        ) else {
+            warn!("sync: can't serialize queue payload");
+            return;
         };
         let res = sqlx::query(
             "INSERT INTO watched_sync_queue \
-             (user_id, server_id, title_key, provider_ids, played, attempts, updated_at) \
+             (user_id, server_id, title_key, match_key, user_data, attempts, updated_at) \
              VALUES (?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP) \
              ON CONFLICT(user_id, server_id, title_key) DO UPDATE SET \
-               provider_ids = excluded.provider_ids, played = excluded.played, \
+               match_key = excluded.match_key, user_data = excluded.user_data, \
                attempts = 0, updated_at = CURRENT_TIMESTAMP",
         )
         .bind(user_id)
         .bind(server_id)
         .bind(title_key)
-        .bind(&json)
-        .bind(played)
+        .bind(&mk)
+        .bind(&ud)
         .execute(&self.pool)
         .await;
         if let Err(e) = res {
-            warn!("watched-sync: enqueue failed: {e}");
+            warn!("sync: enqueue failed: {e}");
         }
     }
 
@@ -307,7 +317,7 @@ impl WatchedSyncQueue {
 
     async fn list_pending(&self) -> Vec<QueueEntry> {
         let rows = sqlx::query(
-            "SELECT id, user_id, server_id, title_key, provider_ids, played \
+            "SELECT id, user_id, server_id, title_key, match_key, user_data \
              FROM watched_sync_queue WHERE attempts < ? ORDER BY updated_at LIMIT 500",
         )
         .bind(MAX_RETRY_ATTEMPTS)
@@ -316,14 +326,15 @@ impl WatchedSyncQueue {
         .unwrap_or_default();
         rows.iter()
             .filter_map(|r| {
-                let json: String = r.try_get("provider_ids").ok()?;
+                let mk: String = r.try_get("match_key").ok()?;
+                let ud: String = r.try_get("user_data").ok()?;
                 Some(QueueEntry {
                     id: r.try_get("id").ok()?,
                     user_id: r.try_get("user_id").ok()?,
                     server_id: r.try_get("server_id").ok()?,
                     title_key: r.try_get("title_key").ok()?,
-                    provider_ids: serde_json::from_str(&json).ok()?,
-                    played: r.try_get::<i64, _>("played").ok()? != 0,
+                    match_key: serde_json::from_str(&mk).ok()?,
+                    user_data: serde_json::from_str(&ud).ok()?,
                 })
             })
             .collect()
@@ -339,7 +350,7 @@ pub fn spawn_retry_loop(
 ) {
     let interval = interval_secs.max(5);
     tokio::spawn(async move {
-        info!("Starting watched-sync retry loop (interval {interval}s)");
+        info!("Starting playback-sync retry loop (interval {interval}s)");
         loop {
             tokio::time::sleep(Duration::from_secs(interval)).await;
             drain_queue(&queue, &user_auth, &backend_health).await;
@@ -357,7 +368,7 @@ async fn drain_queue(
     if pending.is_empty() {
         return;
     }
-    debug!("watched-sync: draining {} queued change(s)", pending.len());
+    debug!("sync: draining {} queued change(s)", pending.len());
     for e in pending {
         // Leave it queued while the peer is still ejected/down.
         if backend_health.is_ejected(e.server_id).await {
@@ -377,10 +388,10 @@ async fn drain_queue(
             queue.bump(e.id).await;
             continue;
         };
-        match sync_one_peer(&session, &server, &e.provider_ids, &e.title_key, e.played).await {
+        match sync_one_peer(&session, &server, &e.match_key, &e.title_key, &e.user_data).await {
             PeerOutcome::Synced | PeerOutcome::NoMatch => {
                 queue.remove_by_id(e.id).await;
-                info!("watched-sync: drained queued change for '{}'", server.name);
+                info!("sync: drained queued change for '{}'", server.name);
             }
             PeerOutcome::Failed => queue.bump(e.id).await,
         }
@@ -389,7 +400,7 @@ async fn drain_queue(
 
 #[cfg(test)]
 mod tests {
-    use super::{played_item_id_from_path, title_key};
+    use super::*;
 
     #[test]
     fn parses_played_items_path() {
@@ -400,19 +411,53 @@ mod tests {
     }
 
     #[test]
+    fn parses_favorite_items_path() {
+        assert_eq!(
+            favorite_item_id_from_path("/Users/abc/FavoriteItems/xyz"),
+            Some("xyz")
+        );
+        assert_eq!(played_item_id_from_path("/Users/abc/FavoriteItems/xyz"), None);
+    }
+
+    #[test]
     fn rejects_unrelated_paths() {
         assert_eq!(played_item_id_from_path("/Users/abc/Items/xyz"), None);
-        assert_eq!(played_item_id_from_path("/Users/abc/FavoriteItems/x"), None);
         assert_eq!(played_item_id_from_path("/Users/abc/PlayedItems/"), None);
         assert_eq!(played_item_id_from_path("/Users/abc/PlayedItems/x/extra"), None);
         assert_eq!(played_item_id_from_path("/System/Info"), None);
     }
 
     #[test]
-    fn title_key_is_order_independent() {
-        let a = title_key(&[("Imdb".into(), "tt1".into()), ("Tmdb".into(), "22".into())]);
-        let b = title_key(&[("Tmdb".into(), "22".into()), ("Imdb".into(), "tt1".into())]);
-        assert_eq!(a, b);
-        assert_eq!(a, "imdb.tt1,tmdb.22");
+    fn recognizes_playing_report_paths() {
+        assert!(is_playing_report_path("/Sessions/Playing"));
+        assert!(is_playing_report_path("/Sessions/Playing/Progress"));
+        assert!(is_playing_report_path("/Sessions/Playing/Stopped"));
+        assert!(!is_playing_report_path("/Sessions/Playing/Ping"));
+        assert!(!is_playing_report_path("/Items"));
+    }
+
+    #[test]
+    fn cache_key_is_order_independent() {
+        let a = MatchKey::Provider(vec![
+            ("Imdb".into(), "tt1".into()),
+            ("Tmdb".into(), "22".into()),
+        ]);
+        let b = MatchKey::Provider(vec![
+            ("Tmdb".into(), "22".into()),
+            ("Imdb".into(), "tt1".into()),
+        ]);
+        assert_eq!(a.cache_key(), b.cache_key());
+        assert_eq!(a.cache_key(), "imdb.tt1,tmdb.22");
+    }
+
+    #[test]
+    fn episode_cache_key_includes_season_episode() {
+        let k = MatchKey::Episode {
+            series: vec![("Tvdb".into(), "999".into())],
+            season: 2,
+            episode: 5,
+        };
+        assert_eq!(k.cache_key(), "tvdb.999|s2e5");
+        assert!(!k.is_empty());
     }
 }

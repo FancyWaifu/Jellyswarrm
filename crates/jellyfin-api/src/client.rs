@@ -289,6 +289,120 @@ impl JellyfinClient {
         Ok(first_provider_match(items, &want))
     }
 
+    /// Read an item's cross-backend match key (provider id, or series+S/E for an
+    /// episode) and its current synced UserData. For an episode this also fetches
+    /// the parent series to get its provider ids.
+    pub async fn get_item_sync_info(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<(MatchKey, ItemUserData), Error> {
+        let path = format!("Users/{user_id}/Items/{item_id}?Fields=ProviderIds");
+        let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+        let user_data = ItemUserData::from_value(v.get("UserData"));
+        let typ = v.get("Type").and_then(|t| t.as_str()).unwrap_or("");
+
+        if typ == "Episode" {
+            let season = v.get("ParentIndexNumber").and_then(|n| n.as_i64());
+            let episode = v.get("IndexNumber").and_then(|n| n.as_i64());
+            let series_id = v.get("SeriesId").and_then(|s| s.as_str());
+            if let (Some(season), Some(episode), Some(series_id)) = (season, episode, series_id) {
+                let sp = format!("Users/{user_id}/Items/{series_id}?Fields=ProviderIds");
+                let sv: serde_json::Value =
+                    self.request(reqwest::Method::GET, &sp, None).await?;
+                return Ok((
+                    MatchKey::Episode {
+                        series: providers_from(sv.get("ProviderIds")),
+                        season,
+                        episode,
+                    },
+                    user_data,
+                ));
+            }
+        }
+        Ok((MatchKey::Provider(providers_from(v.get("ProviderIds"))), user_data))
+    }
+
+    /// Resolve "the same title" on this backend for a [`MatchKey`] → its item id,
+    /// or `None` if this backend doesn't have it. Movies/series match by provider
+    /// id; episodes resolve the series by provider id then match season+episode.
+    pub async fn find_item_by_match(
+        &self,
+        user_id: &str,
+        key: &MatchKey,
+    ) -> Result<Option<String>, Error> {
+        match key {
+            MatchKey::Provider(pairs) => {
+                let want = identifying_want(pairs);
+                if want.is_empty() {
+                    return Ok(None);
+                }
+                let path = format!(
+                    "Users/{user_id}/Items?Recursive=true&IncludeItemTypes=Movie,Series\
+                     &Fields=ProviderIds&EnableImages=false&EnableUserData=false"
+                );
+                let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+                let Some(items) = v.get("Items").and_then(|i| i.as_array()) else {
+                    return Ok(None);
+                };
+                Ok(first_provider_match(items, &want))
+            }
+            MatchKey::Episode {
+                series,
+                season,
+                episode,
+            } => {
+                let want = identifying_want(series);
+                if want.is_empty() {
+                    return Ok(None);
+                }
+                // Find the peer's matching series first…
+                let path = format!(
+                    "Users/{user_id}/Items?Recursive=true&IncludeItemTypes=Series\
+                     &Fields=ProviderIds&EnableImages=false&EnableUserData=false"
+                );
+                let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+                let Some(items) = v.get("Items").and_then(|i| i.as_array()) else {
+                    return Ok(None);
+                };
+                let Some(series_id) = first_provider_match(items, &want) else {
+                    return Ok(None);
+                };
+                // …then the episode within it by season+episode number.
+                let path = format!(
+                    "Users/{user_id}/Items?ParentId={series_id}&Recursive=true\
+                     &IncludeItemTypes=Episode&EnableImages=false&EnableUserData=false"
+                );
+                let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+                let Some(eps) = v.get("Items").and_then(|i| i.as_array()) else {
+                    return Ok(None);
+                };
+                Ok(first_episode_match(eps, *season, *episode))
+            }
+        }
+    }
+
+    /// Write the synced UserData fields onto an item for a user.
+    pub async fn apply_user_data(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        ud: &ItemUserData,
+    ) -> Result<(), Error> {
+        let mut body = serde_json::json!({
+            "Played": ud.played,
+            "PlaybackPositionTicks": ud.playback_position_ticks,
+            "PlayCount": ud.play_count,
+            "IsFavorite": ud.is_favorite,
+        });
+        if let Some(d) = &ud.last_played_date {
+            body["LastPlayedDate"] = serde_json::json!(d);
+        }
+        let path = format!("Users/{user_id}/Items/{item_id}/UserData");
+        self.request_no_content(reqwest::Method::POST, &path, Some(&body))
+            .await
+    }
+
     /// Fetch a backend item's `MediaSources` (raw JSON), used to merge a peer
     /// backend's copy of a movie in as a selectable "version".
     pub async fn get_item_media_sources(
@@ -501,6 +615,105 @@ fn first_provider_match(
                     .is_some_and(|v| want.contains(&(k.to_lowercase(), v.to_string())))
         });
         if hit {
+            if let Some(id) = item.get("Id").and_then(|i| i.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The subset of a user's per-item state synced across backends.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ItemUserData {
+    pub played: bool,
+    pub playback_position_ticks: i64,
+    pub play_count: i64,
+    pub is_favorite: bool,
+    pub last_played_date: Option<String>,
+}
+
+impl ItemUserData {
+    /// Parse from a Jellyfin item's `UserData` object.
+    fn from_value(ud: Option<&serde_json::Value>) -> Self {
+        let g = |k: &str| ud.and_then(|u| u.get(k));
+        ItemUserData {
+            played: g("Played").and_then(|v| v.as_bool()).unwrap_or(false),
+            playback_position_ticks: g("PlaybackPositionTicks")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            play_count: g("PlayCount").and_then(|v| v.as_i64()).unwrap_or(0),
+            is_favorite: g("IsFavorite").and_then(|v| v.as_bool()).unwrap_or(false),
+            last_played_date: g("LastPlayedDate")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }
+    }
+}
+
+/// How to find "the same title" on a peer backend. Movies and series match on
+/// their identifying provider id; episodes match on their *series'* provider id
+/// plus season+episode number (episode-level ids are too spotty to rely on).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MatchKey {
+    Provider(Vec<(String, String)>),
+    Episode {
+        series: Vec<(String, String)>,
+        season: i64,
+        episode: i64,
+    },
+}
+
+impl MatchKey {
+    /// A stable string key (for caching / queue dedup), order-independent.
+    pub fn cache_key(&self) -> String {
+        match self {
+            MatchKey::Provider(p) => provider_key_str(p),
+            MatchKey::Episode {
+                series,
+                season,
+                episode,
+            } => format!("{}|s{season}e{episode}", provider_key_str(series)),
+        }
+    }
+    /// No identifying ids at all → can't match anything cross-backend.
+    pub fn is_empty(&self) -> bool {
+        let p = match self {
+            MatchKey::Provider(p) | MatchKey::Episode { series: p, .. } => p,
+        };
+        !p.iter().any(|(k, _)| is_identifying_provider_key(k))
+    }
+}
+
+fn provider_key_str(p: &[(String, String)]) -> String {
+    let mut v: Vec<String> = p.iter().map(|(k, val)| format!("{}.{val}", k.to_lowercase())).collect();
+    v.sort();
+    v.join(",")
+}
+
+fn providers_from(p: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    p.and_then(|p| p.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn identifying_want(p: &[(String, String)]) -> std::collections::HashSet<(String, String)> {
+    p.iter()
+        .filter(|(k, _)| is_identifying_provider_key(k))
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect()
+}
+
+/// First episode in `items` matching `season`/`episode` number → its `Id`.
+fn first_episode_match(items: &[serde_json::Value], season: i64, episode: i64) -> Option<String> {
+    for item in items {
+        let s = item.get("ParentIndexNumber").and_then(|n| n.as_i64());
+        let e = item.get("IndexNumber").and_then(|n| n.as_i64());
+        if s == Some(season) && e == Some(episode) {
             if let Some(id) = item.get("Id").and_then(|i| i.as_str()) {
                 return Some(id.to_string());
             }

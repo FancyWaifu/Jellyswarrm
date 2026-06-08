@@ -952,28 +952,31 @@ async fn proxy_handler(
         preprocessed.request
     );
 
-    // Cross-server watched-state sync: if this is a mark played/unplayed
-    // (`POST`/`DELETE /Users/{id}/PlayedItems/{itemId}`), capture what the
-    // detached fan-out needs now, before `request` is moved. Fired only after
-    // the source mark itself succeeds (below).
-    let watched_hook = {
-        let method = preprocessed.request.method().clone();
-        let is_mark = matches!(method, reqwest::Method::POST | reqwest::Method::DELETE);
-        match (
-            is_mark,
-            watched_sync::played_item_id_from_path(request_url.path()),
-        ) {
-            (true, Some(item_id)) => preprocessed.session.as_ref().map(|src| {
-                (
-                    preprocessed.server.clone(),
-                    src.clone(),
-                    item_id.to_string(),
-                    method == reqwest::Method::POST,
-                )
-            }),
-            _ => None,
-        }
+    // Cross-server playback-state sync. Capture what the detached fan-out needs
+    // now, before `request` is moved; it fires only after the source write
+    // succeeds (below). Triggers: mark played/unplayed and favorite/unfavorite
+    // (item id in the path), and playback stop/pause (item id in the body, read
+    // after id-mapping further down). The fan-out re-reads the source item's full
+    // UserData, so all we capture here is which item changed.
+    let sync_src = preprocessed
+        .session
+        .as_ref()
+        .map(|src| (preprocessed.server.clone(), src.clone()));
+    let method = preprocessed.request.method().clone();
+    let path_item: Option<String> = if matches!(
+        method,
+        reqwest::Method::POST | reqwest::Method::DELETE
+    ) {
+        watched_sync::played_item_id_from_path(request_url.path())
+            .or_else(|| watched_sync::favorite_item_id_from_path(request_url.path()))
+            .map(str::to_string)
+    } else {
+        None
     };
+    let is_playing_report = method == reqwest::Method::POST
+        && watched_sync::is_playing_report_path(request_url.path());
+    let playing_is_stopped = request_url.path().trim_end_matches('/').ends_with("/Stopped");
+    let mut playing_item: Option<String> = None;
 
     let payload_processing_context = RequestProcessingContext::new(&preprocessed);
     let mut request = preprocessed.request;
@@ -987,6 +990,22 @@ async fn proxy_handler(
                     error!("Failed to process JSON body: {}", e);
                     StatusCode::BAD_REQUEST
                 })?;
+        // Playback report: sync only on stop or pause (not every running tick),
+        // pulling the now-id-mapped backend ItemId from the processed body.
+        if is_playing_report {
+            let paused = response
+                .data
+                .get("IsPaused")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if playing_is_stopped || paused {
+                playing_item = response
+                    .data
+                    .get("ItemId")
+                    .and_then(|i| i.as_str())
+                    .map(str::to_string);
+            }
+        }
         if response.was_modified {
             debug!("Modified JSON body for request to {}", request_url);
             let new_body = serde_json::to_vec(&response.data).map_err(|e| {
@@ -1012,15 +1031,18 @@ async fn proxy_handler(
             "Upstream server returned error status: {} for Request to: {}",
             status, request_url
         );
-    } else if let Some((src_server, src_session, item_id, played)) = watched_hook {
-        if state.config.read().await.watched_state_sync {
+    } else if state.config.read().await.watched_state_sync {
+        // A path trigger (played/favorite) or a playback stop/pause — fan the
+        // source item's UserData out to the user's other backends.
+        if let (Some((src_server, src_session)), Some(item_id)) =
+            (sync_src, path_item.or(playing_item))
+        {
             tokio::spawn(watched_sync::fan_out(
                 state.watched_sync_queue.clone(),
                 state.user_authorization.clone(),
                 src_server,
                 src_session,
                 item_id,
-                played,
             ));
         }
     }
