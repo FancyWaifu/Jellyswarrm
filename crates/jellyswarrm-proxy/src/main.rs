@@ -44,6 +44,7 @@ mod ui;
 mod url_helper;
 mod user_authorization_service;
 mod validation;
+mod view_merge;
 mod watched_sync;
 
 use backend_health::BackendHealth;
@@ -93,6 +94,7 @@ pub struct AppState {
     pub auth_rate_limiter: Arc<AuthRateLimiter>,
     pub backend_health: BackendHealth,
     pub watched_sync_queue: Arc<watched_sync::WatchedSyncQueue>,
+    pub view_merge: Arc<view_merge::ViewMergeRegistry>,
 }
 
 impl AppState {
@@ -129,6 +131,7 @@ impl AppState {
             auth_rate_limiter: Arc::new(AuthRateLimiter::default_auth_limiter()),
             backend_health: BackendHealth::new(),
             watched_sync_queue: data_context.watched_sync_queue,
+            view_merge: Arc::new(view_merge::ViewMergeRegistry::new()),
         }
     }
 

@@ -31,6 +31,16 @@ pub async fn get_items_from_all_servers_if_not_restricted(
     if let Some(query) = req.uri().query() {
         // Check if the request is for a specific series or folder
         if SERIES_OR_PARENT_RE.is_match(query) {
+            // If the parent is a *merged* library, fan out across the backends it
+            // stands in for (each with its own library id) and dedup, instead of
+            // routing to a single backend.
+            if let Some(parent_id) = parent_id_from_query(query) {
+                if let Some(members) = state.view_merge.members(&parent_id) {
+                    let map: std::collections::HashMap<i64, String> =
+                        members.into_iter().collect();
+                    return get_items_from_all_servers_inner(state, req, Some(map)).await;
+                }
+            }
             return get_items(State(state), req).await;
         }
     }
@@ -41,6 +51,17 @@ pub async fn get_items_from_all_servers_if_not_restricted(
 pub async fn get_items_from_all_servers(
     State(state): State<AppState>,
     req: Request,
+) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
+    get_items_from_all_servers_inner(state, req, None).await
+}
+
+/// `parent_override`: when set (a merged-library browse), each backend's request
+/// gets its `ParentId` replaced by that backend's own library id, so a single
+/// merged view fans out across the libraries it stands in for.
+async fn get_items_from_all_servers_inner(
+    state: AppState,
+    req: Request,
+    parent_override: Option<std::collections::HashMap<i64, String>>,
 ) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
     let (original_request, _, _, sessions, _) =
         extract_request_infos(req, &state).await.map_err(|e| {
@@ -94,6 +115,10 @@ pub async fn get_items_from_all_servers(
         // default — ensure the backend returns them.
         if dedup_movies {
             ensure_provider_ids_field(&mut request);
+        }
+        // Merged-library browse: point this backend at its own library.
+        if let Some(pid) = parent_override.as_ref().and_then(|m| m.get(&server.id)) {
+            set_parent_id(&mut request, pid);
         }
         let state_clone = state.clone();
         let server_clone = server.clone();
@@ -239,9 +264,11 @@ pub async fn get_items_from_all_servers(
         }
     }
 
-    // Collapse the same movie appearing on multiple backends into one entry.
+    // Collapse same-type libraries across backends into one view (registering
+    // the merge group for ParentId fan-out), then collapse duplicate movies.
     let interleaved_items: Vec<crate::models::MediaItem> = if dedup_movies {
-        dedup_movies_by_provider(interleaved_items)
+        let merged = dedup_and_register_views(&state, interleaved_items).await;
+        dedup_movies_by_provider(merged)
     } else {
         interleaved_items.into_iter().map(|(item, _)| item).collect()
     };
@@ -348,6 +375,78 @@ fn dedup_movies_by_provider(
         }
     }
     out.into_iter().map(|(item, _)| item).collect()
+}
+
+/// Replace (or add) the `ParentId` query param on a backend request.
+fn set_parent_id(req: &mut reqwest::Request, parent_id: &str) {
+    let mut url = req.url().clone();
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("ParentId"))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.push(("ParentId".to_string(), parent_id.to_string()));
+    url.query_pairs_mut().clear().extend_pairs(pairs.iter());
+    *req.url_mut() = url;
+}
+
+fn parent_id_from_query(query: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k.eq_ignore_ascii_case("ParentId"))
+        .map(|(_, v)| v.into_owned())
+}
+
+/// Collapse same-type library views across backends into one canonical view
+/// (highest-priority backend), preserving order, and register each merge group
+/// in the registry so a later browse of that view fans out across its backends.
+/// Items without a `collection_type` (i.e. not libraries) pass through.
+async fn dedup_and_register_views(
+    state: &AppState,
+    items: Vec<(crate::models::MediaItem, i32)>,
+) -> Vec<(crate::models::MediaItem, i32)> {
+    use std::collections::HashMap;
+    let mut out: Vec<(crate::models::MediaItem, i32)> = Vec::with_capacity(items.len());
+    let mut canonical_idx: HashMap<String, usize> = HashMap::new();
+    let mut group_members: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+
+    for (item, priority) in items {
+        let Some(ct) = item.collection_type.as_ref() else {
+            out.push((item, priority));
+            continue;
+        };
+        let Some(server_id) = state
+            .media_storage
+            .get_media_mapping_with_server(&item.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, s)| s.id)
+        else {
+            out.push((item, priority));
+            continue;
+        };
+        let key = format!("{ct:?}");
+        group_members
+            .entry(key.clone())
+            .or_default()
+            .push((server_id, item.id.clone()));
+        match canonical_idx.get(&key) {
+            // Keep the higher-priority backend's view as the canonical one.
+            Some(&idx) if priority <= out[idx].1 => {}
+            Some(&idx) => out[idx] = (item, priority),
+            None => {
+                canonical_idx.insert(key, out.len());
+                out.push((item, priority));
+            }
+        }
+    }
+
+    for (key, members) in group_members {
+        if let Some(&idx) = canonical_idx.get(&key) {
+            state.view_merge.register(out[idx].0.id.clone(), members);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
