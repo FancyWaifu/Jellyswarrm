@@ -289,6 +289,21 @@ impl JellyfinClient {
         Ok(first_provider_match(items, &want))
     }
 
+    /// Fetch a backend item's `MediaSources` (raw JSON), used to merge a peer
+    /// backend's copy of a movie in as a selectable "version".
+    pub async fn get_item_media_sources(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<Vec<serde_json::Value>, Error> {
+        let path = format!("Users/{user_id}/Items/{item_id}?Fields=MediaSources");
+        let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+        Ok(v.get("MediaSources")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Mark an item played (`POST`) or unplayed (`DELETE`) for a user.
     pub async fn set_played(
         &self,

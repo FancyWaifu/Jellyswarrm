@@ -147,6 +147,8 @@ pub async fn get_stream(
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Response, StatusCode> {
+    // A selected federated "version" pins streaming to that source's backend.
+    let req = crate::handlers::items::pin_to_media_source(&state, req).await;
     let preprocessed = preprocess_request(req, &state).await.map_err(|e| {
         error!("Failed to preprocess request: {}", e);
         StatusCode::BAD_REQUEST

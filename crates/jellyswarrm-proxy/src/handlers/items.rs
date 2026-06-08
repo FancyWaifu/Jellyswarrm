@@ -28,18 +28,103 @@ pub async fn get_item(
         StatusCode::BAD_REQUEST
     })?;
 
-    let server = preprocessed.server;
+    let server = preprocessed.server.clone();
+    let sessions = preprocessed.sessions.clone();
 
     match execute_json_request::<MediaItem>(&state.reqwest_client, preprocessed.request).await {
         Ok(media_item) => {
             let server_id = { state.config.read().await.server_id.clone() };
-            Ok(Json(
-                process_media_item(media_item, &state, &server, false, &server_id).await?,
-            ))
+            let mut item = process_media_item(media_item, &state, &server, false, &server_id).await?;
+            // With dedup on, expose the same movie on other backends as
+            // selectable "versions" (MediaSources), so the user can pick which
+            // server to stream from.
+            if state.config.read().await.dedup_movies {
+                if let Some(sessions) = &sessions {
+                    aggregate_movie_versions(&state, &mut item, &server, sessions).await;
+                }
+            }
+            Ok(Json(item))
         }
         Err(e) => {
             error!("Failed to get MediaItem: {:?}", e);
             Err(e)
+        }
+    }
+}
+
+/// Merge each other backend's copy of this movie in as an additional, labeled
+/// `MediaSource`, so Jellyfin's native "Version" picker lets the user choose
+/// which server to stream from. Matched by ProviderIds (collection keys
+/// excluded). The home backend's own sources are labeled with its server name;
+/// the home `MediaSources` are already virtualized by `process_media_item`.
+async fn aggregate_movie_versions(
+    state: &AppState,
+    item: &mut MediaItem,
+    home_server: &crate::server_storage::Server,
+    sessions: &[(
+        crate::user_authorization_service::AuthorizationSession,
+        crate::server_storage::Server,
+    )],
+) {
+    use crate::models::enums::BaseItemKind;
+    if item.item_type != BaseItemKind::Movie {
+        return;
+    }
+    let providers: Vec<(String, String)> = item
+        .provider_ids
+        .as_ref()
+        .and_then(|p| p.as_object())
+        .map(|o| {
+            o.iter()
+                .filter(|(k, _)| !k.to_lowercase().contains("collection"))
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if providers.is_empty() {
+        return;
+    }
+    // Label the home backend's own sources.
+    if let Some(srcs) = item.media_sources.as_mut() {
+        for s in srcs.iter_mut() {
+            s.name = Some(home_server.name.clone());
+        }
+    }
+    for (session, server) in sessions {
+        if server.id == home_server.id {
+            continue;
+        }
+        let client = match jellyfin_api::JellyfinClient::new(
+            server.url.as_str(),
+            crate::config::CLIENT_INFO.clone(),
+        ) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        client.with_token(session.jellyfin_token.clone()).await;
+        let peer_item_id = match client
+            .find_item_id_by_provider_ids(&session.original_user_id, &providers)
+            .await
+        {
+            Ok(Some(id)) => id,
+            _ => continue,
+        };
+        let raw_sources = match client
+            .get_item_media_sources(&session.original_user_id, &peer_item_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for raw in raw_sources {
+            let mut src: crate::models::MediaSource = match serde_json::from_value(raw) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            src.name = Some(server.name.clone());
+            if let Ok(v) = process_media_source(src, &state.media_storage, server).await {
+                item.media_sources.get_or_insert_with(Vec::new).push(v);
+            }
         }
     }
 }
@@ -109,12 +194,117 @@ pub async fn get_items_list(
     }
 }
 
+/// Replace the id segment right after `/Items/` or `/Videos/` with `new_id`.
+fn rewrite_item_segment(path: &str, new_id: &str) -> Option<String> {
+    let mut segs: Vec<String> = path.split('/').map(String::from).collect();
+    for i in 0..segs.len() {
+        if (segs[i].eq_ignore_ascii_case("Items") || segs[i].eq_ignore_ascii_case("Videos"))
+            && i + 1 < segs.len()
+            && !segs[i + 1].is_empty()
+        {
+            segs[i + 1] = new_id.to_string();
+            return Some(segs.join("/"));
+        }
+    }
+    None
+}
+
+fn item_segment(path: &str) -> Option<String> {
+    let segs: Vec<&str> = path.split('/').collect();
+    for i in 0..segs.len() {
+        if (segs[i].eq_ignore_ascii_case("Items") || segs[i].eq_ignore_ascii_case("Videos"))
+            && i + 1 < segs.len()
+            && !segs[i + 1].is_empty()
+        {
+            return Some(segs[i + 1].to_string());
+        }
+    }
+    None
+}
+
+/// When a request carries a `MediaSourceId` (query for streams, JSON body for
+/// PlaybackInfo) that lives on a *different* backend than the item in the path —
+/// i.e. the user picked a federated "version" — pin routing to the source's
+/// backend by rewriting the `/Items/{id}` (or `/Videos/{id}`) segment to the
+/// source id. No-op for normal playback (source on the item's own backend) and
+/// for native multi-version items (same backend), so it's safe to apply always.
+pub async fn pin_to_media_source(state: &AppState, req: Request) -> Request {
+    use axum::extract::OriginalUri;
+    let (mut parts, body) = req.into_parts();
+
+    // The router resolves the backend from the ORIGINAL uri (axum nesting strips
+    // the `/Videos` or `/Items` prefix from parts.uri), so we must read and
+    // rewrite that, not parts.uri.
+    let original = parts.extensions.get::<OriginalUri>().map(|o| o.0.clone());
+    let full_path = original
+        .as_ref()
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    let query = original
+        .as_ref()
+        .and_then(|u| u.query().map(String::from))
+        .or_else(|| parts.uri.query().map(String::from));
+
+    let mut msid = query.as_deref().and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes())
+            .find(|(k, _)| k.eq_ignore_ascii_case("MediaSourceId"))
+            .map(|(_, v)| v.into_owned())
+    });
+    let bytes = axum::body::to_bytes(body, 4 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    if msid.is_none() && !bytes.is_empty() {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            msid = json
+                .get("MediaSourceId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+        }
+    }
+
+    if let (Some(msid), Some(item_id)) =
+        (msid.filter(|s| !s.is_empty()), item_segment(&full_path))
+    {
+        if msid != item_id {
+            let src_srv = state
+                .media_storage
+                .get_media_mapping_with_server(&msid)
+                .await
+                .ok()
+                .flatten()
+                .map(|(_, s)| s.id);
+            let item_srv = state
+                .media_storage
+                .get_media_mapping_with_server(&item_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|(_, s)| s.id);
+            if src_srv.is_some() && src_srv != item_srv {
+                if let Some(new_path) = rewrite_item_segment(&full_path, &msid) {
+                    let pq = match &query {
+                        Some(q) => format!("{new_path}?{q}"),
+                        None => new_path,
+                    };
+                    if let Ok(uri) = pq.parse::<axum::http::Uri>() {
+                        debug!("Pinned routing to selected media-source backend: {}", uri);
+                        parts.extensions.insert(OriginalUri(uri));
+                    }
+                }
+            }
+        }
+    }
+    Request::from_parts(parts, axum::body::Body::from(bytes))
+}
+
 //http://192.168.188.142:30013/Items/165a66aa5bd2e62c0df0f8da332ae47d/PlaybackInfo
 #[axum::debug_handler]
 pub async fn post_playback_info(
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Json<PlaybackResponse>, StatusCode> {
+    let req = pin_to_media_source(&state, req).await;
     let preprocessed = preprocess_request(req, &state).await.map_err(|e| {
         error!("Failed to preprocess request: {}", e);
         StatusCode::BAD_REQUEST
