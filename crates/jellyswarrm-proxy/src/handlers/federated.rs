@@ -425,7 +425,12 @@ async fn dedup_and_register_views(
             out.push((item, priority));
             continue;
         };
-        let key = format!("{ct:?}");
+        // Merge only libraries that are the SAME (name + type) across backends —
+        // not every library that happens to share a collection type. The proxy
+        // appends " [server]" to names, so match on the base name.
+        let name = item.name.as_deref().unwrap_or("");
+        let base_name = name.rsplit_once(" [").map(|(b, _)| b).unwrap_or(name);
+        let key = format!("{}|{ct:?}", base_name.to_lowercase());
         group_members
             .entry(key.clone())
             .or_default()
