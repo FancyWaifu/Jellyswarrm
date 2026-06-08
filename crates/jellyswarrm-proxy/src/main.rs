@@ -44,6 +44,7 @@ mod ui;
 mod url_helper;
 mod user_authorization_service;
 mod validation;
+mod watched_sync;
 
 use backend_health::BackendHealth;
 use federated_users::FederatedUserService;
@@ -91,6 +92,7 @@ pub struct AppState {
     pub syncplay: Arc<SyncPlayService>,
     pub auth_rate_limiter: Arc<AuthRateLimiter>,
     pub backend_health: BackendHealth,
+    pub watched_sync_queue: Arc<watched_sync::WatchedSyncQueue>,
 }
 
 impl AppState {
@@ -126,6 +128,7 @@ impl AppState {
             syncplay: Arc::new(SyncPlayService::new()),
             auth_rate_limiter: Arc::new(AuthRateLimiter::default_auth_limiter()),
             backend_health: BackendHealth::new(),
+            watched_sync_queue: data_context.watched_sync_queue,
         }
     }
 
@@ -182,6 +185,7 @@ pub struct DataContext {
     pub media_storage: Arc<MediaStorageService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
+    pub watched_sync_queue: Arc<watched_sync::WatchedSyncQueue>,
 }
 
 pub struct JsonProcessors {
@@ -438,6 +442,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         media_storage: Arc::new(media_storage.clone()),
         play_sessions: Arc::new(SessionStorage::new()),
         config: Arc::new(tokio::sync::RwLock::new(loaded_config.clone())),
+        watched_sync_queue: Arc::new(watched_sync::WatchedSyncQueue::new(pool.clone())),
     };
 
     let json_processors = JsonProcessors {
@@ -468,6 +473,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_state.backend_health.clone(),
         app_state.server_storage.clone(),
         Duration::from_secs(10),
+    );
+
+    // Drain queued watched-state syncs to peers that were offline at mark time.
+    watched_sync::spawn_retry_loop(
+        app_state.watched_sync_queue.clone(),
+        app_state.user_authorization.clone(),
+        app_state.backend_health.clone(),
+        loaded_config.watched_sync_retry_interval_secs,
     );
 
     let key = Key::from(loaded_config.session_key.as_slice());
@@ -917,6 +930,29 @@ async fn proxy_handler(
         preprocessed.request
     );
 
+    // Cross-server watched-state sync: if this is a mark played/unplayed
+    // (`POST`/`DELETE /Users/{id}/PlayedItems/{itemId}`), capture what the
+    // detached fan-out needs now, before `request` is moved. Fired only after
+    // the source mark itself succeeds (below).
+    let watched_hook = {
+        let method = preprocessed.request.method().clone();
+        let is_mark = matches!(method, reqwest::Method::POST | reqwest::Method::DELETE);
+        match (
+            is_mark,
+            watched_sync::played_item_id_from_path(request_url.path()),
+        ) {
+            (true, Some(item_id)) => preprocessed.session.as_ref().map(|src| {
+                (
+                    preprocessed.server.clone(),
+                    src.clone(),
+                    item_id.to_string(),
+                    method == reqwest::Method::POST,
+                )
+            }),
+            _ => None,
+        }
+    };
+
     let payload_processing_context = RequestProcessingContext::new(&preprocessed);
     let mut request = preprocessed.request;
 
@@ -954,6 +990,17 @@ async fn proxy_handler(
             "Upstream server returned error status: {} for Request to: {}",
             status, request_url
         );
+    } else if let Some((src_server, src_session, item_id, played)) = watched_hook {
+        if state.config.read().await.watched_state_sync {
+            tokio::spawn(watched_sync::fan_out(
+                state.watched_sync_queue.clone(),
+                state.user_authorization.clone(),
+                src_server,
+                src_session,
+                item_id,
+                played,
+            ));
+        }
     }
     let headers = response.headers().clone();
     let body_bytes = response.bytes().await.map_err(|e| {

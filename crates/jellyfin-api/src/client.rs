@@ -225,6 +225,86 @@ impl JellyfinClient {
         self.request(reqwest::Method::GET, "Users/Me", None).await
     }
 
+    // ----- watched-state sync helpers (cross-server played/unplayed) -----
+
+    /// Fetch an item's `ProviderIds` (to match the same title across backends)
+    /// AND its current `Played` state for this user, in one call. Re-reading the
+    /// authoritative source state lets the sync converge correctly under rapid
+    /// play/unplay toggles, regardless of fan-out task ordering.
+    pub async fn get_item_match_info(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<(std::collections::HashMap<String, String>, Option<bool>), Error> {
+        let path = format!("Users/{user_id}/Items/{item_id}?Fields=ProviderIds");
+        let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+        let providers = v
+            .get("ProviderIds")
+            .and_then(|p| p.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let played = v
+            .get("UserData")
+            .and_then(|u| u.get("Played"))
+            .and_then(|p| p.as_bool());
+        Ok((providers, played))
+    }
+
+    /// Find a movie on this backend matching ANY of the given provider ids.
+    /// `provider_ids` are (key, value) pairs, e.g. `("Imdb","tt0063350")`. Returns
+    /// the backend's item id, or `None` if nothing matches.
+    ///
+    /// Jellyfin's server-side `AnyProviderIdEquals` filter is unreliable across
+    /// versions (silently ignored on current builds), so we list the user's
+    /// movies with their `ProviderIds` and match client-side. The caller memoises
+    /// the result, so this lists a backend's movies at most once per title/hour.
+    pub async fn find_item_id_by_provider_ids(
+        &self,
+        user_id: &str,
+        provider_ids: &[(String, String)],
+    ) -> Result<Option<String>, Error> {
+        // Match only on *identifying* keys — collection-type keys are shared
+        // across a franchise and would false-match a sibling movie. If the source
+        // had only collection ids, refuse to match rather than guess wrong.
+        let want: std::collections::HashSet<(String, String)> = provider_ids
+            .iter()
+            .filter(|(k, _)| is_identifying_provider_key(k))
+            .map(|(k, v)| (k.to_lowercase(), v.clone()))
+            .collect();
+        if want.is_empty() {
+            return Ok(None);
+        }
+        let path = format!(
+            "Users/{user_id}/Items?Recursive=true&IncludeItemTypes=Movie\
+             &Fields=ProviderIds&EnableImages=false&EnableUserData=false"
+        );
+        let v: serde_json::Value = self.request(reqwest::Method::GET, &path, None).await?;
+        let Some(items) = v.get("Items").and_then(|i| i.as_array()) else {
+            return Ok(None);
+        };
+        Ok(first_provider_match(items, &want))
+    }
+
+    /// Mark an item played (`POST`) or unplayed (`DELETE`) for a user.
+    pub async fn set_played(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        played: bool,
+    ) -> Result<(), Error> {
+        let method = if played {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::DELETE
+        };
+        let path = format!("Users/{user_id}/PlayedItems/{item_id}");
+        self.request_no_content(method, &path, None).await
+    }
+
     pub async fn get_media_folders(
         &self,
         user_id: Option<&str>,
@@ -381,10 +461,119 @@ impl JellyfinClient {
     }
 }
 
+/// Whether a provider key uniquely identifies a single item. Collection-type
+/// keys (e.g. `TmdbCollection`) are shared by every movie in a franchise, so
+/// matching on them would mark the wrong sibling — they're excluded.
+fn is_identifying_provider_key(key: &str) -> bool {
+    !key.to_lowercase().contains("collection")
+}
+
+/// First item in `items` whose `ProviderIds` share an *identifying* (key,value)
+/// pair with `want` (keys compared case-insensitively, values exactly). Pure,
+/// testable core of [`JellyfinClient::find_item_id_by_provider_ids`].
+fn first_provider_match(
+    items: &[serde_json::Value],
+    want: &std::collections::HashSet<(String, String)>,
+) -> Option<String> {
+    for item in items {
+        let Some(pids) = item.get("ProviderIds").and_then(|p| p.as_object()) else {
+            continue;
+        };
+        let hit = pids.iter().any(|(k, val)| {
+            is_identifying_provider_key(k)
+                && val
+                    .as_str()
+                    .is_some_and(|v| want.contains(&(k.to_lowercase(), v.to_string())))
+        });
+        if hit {
+            if let Some(id) = item.get("Id").and_then(|i| i.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::HashSet;
     use wiremock::matchers::{method, path};
+
+    fn want(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn identifying_key_excludes_collections() {
+        assert!(is_identifying_provider_key("Imdb"));
+        assert!(is_identifying_provider_key("Tmdb"));
+        assert!(is_identifying_provider_key("Tvdb"));
+        assert!(!is_identifying_provider_key("TmdbCollection"));
+        assert!(!is_identifying_provider_key("tvdbcollection"));
+    }
+
+    #[test]
+    fn matches_strong_id_not_collection_sibling() {
+        // Source = "Iron Man". The peer lists the SIBLING "Iron Man 2" FIRST
+        // (same TmdbCollection, different Imdb), then the correct "Iron Man".
+        // Must pick the correct movie, never the collection sibling.
+        let items = vec![
+            json!({"Id":"sibling","ProviderIds":{"Imdb":"tt1228705","Tmdb":"10138","TmdbCollection":"131292"}}),
+            json!({"Id":"correct","ProviderIds":{"Imdb":"tt0371746","Tmdb":"1726","TmdbCollection":"131292"}}),
+        ];
+        let w = want(&[
+            ("Imdb", "tt0371746"),
+            ("Tmdb", "1726"),
+            ("TmdbCollection", "131292"),
+        ]);
+        assert_eq!(first_provider_match(&items, &w).as_deref(), Some("correct"));
+    }
+
+    #[test]
+    fn collection_only_overlap_does_not_match() {
+        // The only shared id is a collection -> refuse (would guess a sibling).
+        let items = vec![
+            json!({"Id":"sibling","ProviderIds":{"Imdb":"tt9999999","TmdbCollection":"131292"}}),
+        ];
+        assert_eq!(first_provider_match(&items, &want(&[("TmdbCollection", "131292")])), None);
+        assert_eq!(
+            first_provider_match(&items, &want(&[("Imdb", "tt0371746"), ("TmdbCollection", "131292")])),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_match_and_miss() {
+        let items = vec![
+            json!({"Id":"a","ProviderIds":{"Imdb":"tt1"}}),
+            json!({"Id":"b","ProviderIds":{"Tmdb":"22"}}),
+        ];
+        assert_eq!(first_provider_match(&items, &want(&[("Tmdb", "22")])).as_deref(), Some("b"));
+        // case-insensitive key
+        assert_eq!(first_provider_match(&items, &want(&[("tmdb", "22")])).as_deref(), Some("b"));
+        assert_eq!(first_provider_match(&items, &want(&[("Imdb", "nope")])), None);
+    }
+
+    #[test]
+    fn tolerates_malformed_items() {
+        let items = vec![
+            json!({"Id":"noproviders"}),
+            json!({"ProviderIds":{"Imdb":"tt1"}}),            // matches but has no Id
+            json!({"Id":"nullval","ProviderIds":{"Imdb":null,"Tmdb":5}}), // non-string values
+            json!("not even an object"),
+            json!({"Id":"good","ProviderIds":{"Imdb":"tt7"}}),
+        ];
+        assert_eq!(first_provider_match(&items, &want(&[("Imdb", "tt7")])).as_deref(), Some("good"));
+        // a matching item with no Id is skipped, nothing else matches tt1 -> None
+        assert_eq!(first_provider_match(&items, &want(&[("Imdb", "tt1")])), None);
+        // empty input
+        assert_eq!(first_provider_match(&[], &want(&[("Imdb", "tt7")])), None);
+    }
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]

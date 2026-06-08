@@ -49,6 +49,49 @@ services:
       jellyfin-movies:
         condition: service_started
 
+  # Second movies backend sharing the same media — gives the SAME movie
+  # (identical ProviderIds) on two backends, to exercise watched-state sync.
+  jellyfin-movies2:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin-movies2
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - JELLYFIN_PublishedServerUrl=http://localhost:8099
+    volumes:
+      - ./data/jellyfin-movies2/config:/config
+      - ./data/jellyfin-movies2/cache:/cache
+      - ./data/media:/media:ro
+    ports:
+      - "8099:8096"
+    restart: unless-stopped
+    networks:
+      - jellyfin-dev-net
+    depends_on:
+      content-downloader:
+        condition: service_completed_successfully
+
+  jellyfin-movies2-init:
+    image: ghcr.io/astral-sh/uv:python3.11-alpine
+    container_name: jellyfin-movies2-init
+    volumes:
+      - ./scripts/init-jellyfin.py:/scripts/init-jellyfin.py:ro
+    working_dir: /scripts
+    command: ["uv", "run", "/scripts/init-jellyfin.py"]
+    environment:
+      - URL=http://jellyfin-movies2:8096
+      - USERNAME=user
+      - PASSWORD=movies
+      - COLLECTION_NAME=Movies
+      - COLLECTION_PATH=/media/movies
+      - COLLECTION_TYPE=movies
+    networks:
+      - jellyfin-dev-net
+    depends_on:
+      jellyfin-movies2:
+        condition: service_started
+
   jellyfin-tvshows:
     image: jellyfin/jellyfin:latest
     container_name: jellyfin-tvshows

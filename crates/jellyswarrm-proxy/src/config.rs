@@ -343,6 +343,20 @@ pub struct AppConfig {
     /// e.g. behind Cloudflare); leave false for local HTTP dev. (Audit H3.)
     #[serde(default)]
     pub secure_cookies: bool,
+
+    /// Propagate played/unplayed marks to the same title (matched by
+    /// `ProviderIds`) on the user's other backends. Default true.
+    #[serde(default = "default_true")]
+    pub watched_state_sync: bool,
+
+    /// How often (seconds) the retry loop drains watched-state syncs that
+    /// couldn't reach a peer when it was offline. Default 60 (min 5).
+    #[serde(default = "default_watched_sync_retry_interval_secs")]
+    pub watched_sync_retry_interval_secs: u64,
+}
+
+fn default_watched_sync_retry_interval_secs() -> u64 {
+    60
 }
 
 pub const DEFAULT_CONFIG_FILENAME: &str = "jellyswarrm.toml";
