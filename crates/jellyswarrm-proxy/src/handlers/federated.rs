@@ -432,9 +432,23 @@ fn episode_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
 }
 
 /// The dedup key for a "leaf" item (a Movie or an Episode), used to collapse the
-/// same title appearing on multiple backends in an aggregated list.
+/// same title appearing on multiple backends. Prefers a strong identity (provider
+/// id, or series+season+episode), then falls back to the normalized title — so
+/// provider-less items (e.g. episodes imported as movies in a mixed-content
+/// "Media" library, with no metadata) still collapse when their filenames match.
 fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
-    movie_dedup_key(item).or_else(|| episode_dedup_key(item))
+    if !matches!(
+        item.item_type,
+        BaseItemKind::Movie | BaseItemKind::Episode
+    ) {
+        return None;
+    }
+    movie_dedup_key(item)
+        .or_else(|| episode_dedup_key(item))
+        .or_else(|| {
+            let name = strip_server_suffix(item.name.as_deref()?).trim().to_lowercase();
+            (!name.is_empty()).then(|| format!("name#{name}"))
+        })
 }
 
 /// Collapse duplicate Series (same provider id across backends) into one entry,
@@ -770,21 +784,27 @@ async fn dedup_and_register_views(
     let mut group_members: HashMap<String, Vec<(i64, String)>> = HashMap::new();
 
     for (item, priority) in items {
-        let Some(ct) = item.collection_type.as_ref() else {
-            // A library view without a declared type (a "mixed content" library):
-            // can't type-merge it, but still drop the "[server]" suffix so the tile
-            // reads cleanly. Non-library items (movies, episodes…) keep their tag.
-            let mut item = item;
-            if matches!(
+        // Only library views participate in the merge. Typed libraries merge by
+        // collection type (Anime + Cartoon Shows + Shows → one "TV Shows");
+        // untyped "mixed content" libraries merge by name (two "Media" → one
+        // "Media"). Everything else (movies, episodes…) passes through untouched.
+        let is_library = item.collection_type.is_some()
+            || matches!(
                 item.item_type,
                 BaseItemKind::UserView | BaseItemKind::CollectionFolder
-            ) {
-                if let Some(n) = item.name.as_deref() {
-                    item.name = Some(strip_server_suffix(n).to_string());
-                }
+            );
+        let base_name = strip_server_suffix(item.name.as_deref().unwrap_or("")).to_string();
+        let key = match (is_library, item.collection_type.as_ref()) {
+            (false, _) => {
+                out.push((item, priority));
+                continue;
             }
-            out.push((item, priority));
-            continue;
+            (true, Some(ct)) => format!("type:{ct:?}"),
+            (true, None) if !base_name.is_empty() => format!("name:{}", base_name.to_lowercase()),
+            (true, None) => {
+                out.push((item, priority));
+                continue;
+            }
         };
         let Some(server_id) = state
             .media_storage
@@ -797,11 +817,6 @@ async fn dedup_and_register_views(
             out.push((item, priority));
             continue;
         };
-        // Merge every library of the same collection type across backends into one
-        // unified view (so the same show/movie in differently-named libraries on
-        // different servers — Anime vs Cartoon Shows vs Shows — collapses instead
-        // of duplicating).
-        let key = format!("{ct:?}");
         group_members
             .entry(key.clone())
             .or_default()
@@ -820,20 +835,19 @@ async fn dedup_and_register_views(
     for (key, members) in group_members {
         if let Some(&idx) = canonical_idx.get(&key) {
             // A view spanning multiple backend libraries gets a neutral type-based
-            // name (the winning backend's name would be misleading). A single-backend
-            // library keeps its real name, just without the "[server]" suffix.
-            if members.len() > 1 {
-                if let Some(friendly) = out[idx]
-                    .0
-                    .collection_type
-                    .as_ref()
-                    .and_then(friendly_view_name)
-                {
-                    out[idx].0.name = Some(friendly.to_string());
-                }
-            } else if let Some(n) = out[idx].0.name.as_deref() {
-                out[idx].0.name = Some(strip_server_suffix(n).to_string());
-            }
+            // name (the winning backend's name would be misleading); an untyped
+            // merged library keeps its base name. A single-backend library keeps
+            // its real name. In all cases drop the "[server]" suffix.
+            let friendly = out[idx]
+                .0
+                .collection_type
+                .as_ref()
+                .and_then(friendly_view_name);
+            let cleaned = strip_server_suffix(out[idx].0.name.as_deref().unwrap_or("")).to_string();
+            out[idx].0.name = Some(match (members.len() > 1, friendly) {
+                (true, Some(f)) => f.to_string(),
+                _ => cleaned,
+            });
             state.view_merge.register(out[idx].0.id.clone(), members);
         }
     }
@@ -1073,6 +1087,22 @@ mod dedup_tests {
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
         // tt1 collapsed to the priority-100 copy, in tt1's first position
         assert_eq!(ids, vec!["a-hi", "b", "c-noid"]);
+    }
+
+    #[test]
+    fn dedups_provider_less_items_by_name() {
+        // Episodes imported as provider-less movies in a mixed "Media" library:
+        // no ids, no series/episode — the same file name on two backends must
+        // still collapse (by normalized title), while a different title is kept.
+        let mut a: MediaItem = serde_json::from_value(serde_json::json!({"Id":"a","Type":"Movie"})).unwrap();
+        a.name = Some("Squid Game - S02E07 - Friend or Foe [Whiskey jellyfin]".into());
+        let mut b: MediaItem = serde_json::from_value(serde_json::json!({"Id":"b","Type":"Movie"})).unwrap();
+        b.name = Some("Squid Game - S02E07 - Friend or Foe [Stephans jellyfin]".into());
+        let mut c: MediaItem = serde_json::from_value(serde_json::json!({"Id":"c","Type":"Movie"})).unwrap();
+        c.name = Some("Love Death and Robots S04E01 [Whiskey jellyfin]".into());
+        let out = dedup_movies_by_provider(vec![(a, 100), (b, 50), (c, 50)]);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"]);
     }
 
     fn episode(id: &str, series: &str, season: i64, ep: i64) -> MediaItem {
