@@ -35,12 +35,12 @@ pub async fn get_item(
         Ok(media_item) => {
             let server_id = { state.config.read().await.server_id.clone() };
             let mut item = process_media_item(media_item, &state, &server, false, &server_id).await?;
-            // With dedup on, expose the same movie on other backends as
+            // With dedup on, expose the same movie/episode on other backends as
             // selectable "versions" (MediaSources), so the user can pick which
             // server to stream from.
             if state.config.read().await.dedup_movies {
                 if let Some(sessions) = &sessions {
-                    aggregate_movie_versions(&state, &mut item, &server, sessions).await;
+                    aggregate_versions(&state, &mut item, &server, sessions).await;
                 }
             }
             Ok(Json(item))
@@ -52,12 +52,25 @@ pub async fn get_item(
     }
 }
 
-/// Merge each other backend's copy of this movie in as an additional, labeled
-/// `MediaSource`, so Jellyfin's native "Version" picker lets the user choose
-/// which server to stream from. Matched by ProviderIds (collection keys
-/// excluded). The home backend's own sources are labeled with its server name;
-/// the home `MediaSources` are already virtualized by `process_media_item`.
-async fn aggregate_movie_versions(
+/// Token-authenticated client for one backend (for cross-backend version lookups).
+async fn version_client(
+    server: &crate::server_storage::Server,
+    token: &str,
+) -> Option<jellyfin_api::JellyfinClient> {
+    let client =
+        jellyfin_api::JellyfinClient::new(server.url.as_str(), crate::config::CLIENT_INFO.clone())
+            .ok()?;
+    client.with_token(token.to_string()).await;
+    Some(client)
+}
+
+/// Merge each other backend's copy of this movie OR episode in as an additional,
+/// labeled `MediaSource`, so Jellyfin's native "Version" picker lets the user
+/// choose which server to stream from. Movies match by ProviderIds; episodes
+/// match by their series' ProviderIds + season/episode (episode-level ids are
+/// unreliable). The home backend's own sources are labeled with its name; the
+/// home `MediaSources` are already virtualized by `process_media_item`.
+async fn aggregate_versions(
     state: &AppState,
     item: &mut MediaItem,
     home_server: &crate::server_storage::Server,
@@ -67,23 +80,58 @@ async fn aggregate_movie_versions(
     )],
 ) {
     use crate::models::enums::BaseItemKind;
-    if item.item_type != BaseItemKind::Movie {
+    use jellyfin_api::MatchKey;
+
+    // Build the cross-backend match key for this item.
+    let match_key = match item.item_type {
+        BaseItemKind::Movie => {
+            let providers: Vec<(String, String)> = item
+                .provider_ids
+                .as_ref()
+                .and_then(|p| p.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            MatchKey::Provider(providers)
+        }
+        BaseItemKind::Episode => {
+            // Resolve the episode's identity (series providers + S/E) from the home
+            // backend, which also fetches the parent series for its provider ids.
+            let Some((mapping, _)) = state
+                .media_storage
+                .get_media_mapping_with_server(&item.id)
+                .await
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            let Some((home_session, _)) = sessions.iter().find(|(_, s)| s.id == home_server.id)
+            else {
+                return;
+            };
+            let Some(home_client) =
+                version_client(home_server, &home_session.jellyfin_token).await
+            else {
+                return;
+            };
+            match home_client
+                .get_item_sync_info(&home_session.original_user_id, &mapping.original_media_id)
+                .await
+            {
+                Ok((key, _)) => key,
+                Err(_) => return,
+            }
+        }
+        _ => return,
+    };
+    if match_key.is_empty() {
         return;
     }
-    let providers: Vec<(String, String)> = item
-        .provider_ids
-        .as_ref()
-        .and_then(|p| p.as_object())
-        .map(|o| {
-            o.iter()
-                .filter(|(k, _)| !k.to_lowercase().contains("collection"))
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    if providers.is_empty() {
-        return;
-    }
+
     // Label the home backend's own sources.
     if let Some(srcs) = item.media_sources.as_mut() {
         for s in srcs.iter_mut() {
@@ -94,16 +142,11 @@ async fn aggregate_movie_versions(
         if server.id == home_server.id {
             continue;
         }
-        let client = match jellyfin_api::JellyfinClient::new(
-            server.url.as_str(),
-            crate::config::CLIENT_INFO.clone(),
-        ) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Some(client) = version_client(server, &session.jellyfin_token).await else {
+            continue;
         };
-        client.with_token(session.jellyfin_token.clone()).await;
         let peer_item_id = match client
-            .find_item_id_by_provider_ids(&session.original_user_id, &providers)
+            .find_item_by_match(&session.original_user_id, &match_key)
             .await
         {
             Ok(Some(id)) => id,
