@@ -453,11 +453,15 @@ fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
     match item.item_type {
         Movie => movie_dedup_key(item).or_else(|| title().map(|n| format!("mv#{n}"))),
         Episode => episode_dedup_key(item).or_else(|| title().map(|n| format!("ep#{n}"))),
-        // Music + home-video leaf types: cross-server copies of the same track /
-        // video weren't deduped (only movies & episodes were), so they doubled up
-        // in "Recently Added" etc. Match by provider id, else type + artist +
-        // album + title (artist/album keep distinct same-titled tracks apart).
-        Audio | AudioBook | MusicVideo | MusicAlbum | Video | Trailer => {
+        // All remaining LEAF content types (music, books, home videos, photos,
+        // recordings…). Cross-server copies weren't deduped (only movies &
+        // episodes were), so they doubled up in "Recently Added" etc. Match by
+        // provider id, else type + artist + album + track# + title (the extra
+        // fields keep distinct same-titled items apart). Containers (Series,
+        // Season, BoxSet, Playlist, folders, artists…) are NOT here — they're
+        // handled by the view/series merge or pass through.
+        Audio | AudioBook | Book | MusicVideo | MusicAlbum | Video | Trailer | Photo
+        | Recording => {
             if let Some(k) = provider_key(item) {
                 return Some(format!("{:?}#{k}", item.item_type));
             }
@@ -1203,6 +1207,26 @@ mod dedup_tests {
             (audio("b", "Today [Paw jellyfin]", "Smashing Pumpkins", "Gish"), 50), // dup
             (audio("c", "Today [Whiskey jellyfin]", "Willow", "Today"), 50),       // diff artist -> kept
             (audio("d", "Heart-Shaped Box [Whiskey jellyfin]", "Nirvana", "In Utero"), 50),
+        ];
+        let out = dedup_movies_by_provider(items);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c", "d"]);
+    }
+
+    #[test]
+    fn dedups_books_and_other_leaf_types_across_backends() {
+        let leaf = |id: &str, kind: &str, name: &str| -> MediaItem {
+            let mut m: MediaItem =
+                serde_json::from_value(serde_json::json!({"Id": id, "Type": kind})).unwrap();
+            m.name = Some(name.to_string());
+            m
+        };
+        let items = vec![
+            (leaf("a", "Book", "The Holy Bible KJV [Whiskey jellyfin]"), 100),
+            (leaf("b", "Book", "The Holy Bible KJV [Rhens jellyfin]"), 50), // dup -> collapse
+            (leaf("c", "Book", "Dungeon Crawler Carl [Whiskey jellyfin]"), 50), // distinct
+            (leaf("d", "Photo", "IMG_100 [Whiskey jellyfin]"), 50),
+            (leaf("e", "Photo", "IMG_100 [Rhens jellyfin]"), 50), // dup photo -> collapse
         ];
         let out = dedup_movies_by_provider(items);
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
