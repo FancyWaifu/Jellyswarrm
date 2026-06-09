@@ -197,6 +197,17 @@ pub async fn get_items(
                 *item =
                     process_media_item(item.clone(), &state, &server, false, &server_id).await?;
             }
+            // Single-backend browse: collapse duplicate FILES within this one
+            // backend's library (e.g. an episode imported twice in a mixed
+            // library). Cross-backend dedup happens on the fan-out path instead.
+            if state.config.read().await.dedup_movies {
+                use crate::handlers::federated::dedup_leaf_items;
+                use crate::models::ItemsResponseVariants::{Bare, WithCount};
+                match &mut response {
+                    WithCount(w) => w.items = dedup_leaf_items(std::mem::take(&mut w.items)),
+                    Bare(v) => *v = dedup_leaf_items(std::mem::take(v)),
+                }
+            }
 
             Ok(Json(response))
         }

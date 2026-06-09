@@ -549,6 +549,16 @@ async fn dedup_and_register_series(
     out
 }
 
+/// Collapse same-identity leaf items (movies, episodes, music, books…) within a
+/// single list — used to clean up duplicate FILES inside one backend's library
+/// (the cross-backend fan-out already dedups; the single-backend `get_items` path
+/// didn't). All items share one priority, so the first occurrence is kept.
+pub fn dedup_leaf_items(
+    items: Vec<crate::models::MediaItem>,
+) -> Vec<crate::models::MediaItem> {
+    dedup_movies_by_provider(items.into_iter().map(|i| (i, 0)).collect())
+}
+
 /// Collapse duplicate leaf items — movies and episodes that are the same title
 /// across backends — into one entry, keeping the copy from the highest-priority
 /// backend. Position is preserved at first occurrence; anything without a leaf
