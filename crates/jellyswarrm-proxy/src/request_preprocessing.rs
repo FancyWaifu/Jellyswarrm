@@ -372,7 +372,9 @@ pub async fn apply_to_request(
 ) {
     remove_hop_by_hop_headers(request.headers_mut());
 
-    apply_host_header(request, server);
+    // Let reqwest derive Host from the target URL, including its port. An explicit
+    // Host header would otherwise survive redirects to external image hosts.
+    request.headers_mut().remove(reqwest::header::HOST);
 
     apply_authorization_header(request, auth);
 
@@ -537,15 +539,6 @@ pub fn apply_authorization_header(
             }
             JellyfinAuthorization::ApiKey(_) => {}
         }
-    }
-}
-
-pub fn apply_host_header(request: &mut reqwest::Request, server: &Server) {
-    if let Some(host) = server.url.host_str() {
-        request.headers_mut().insert(
-            reqwest::header::HOST,
-            reqwest::header::HeaderValue::from_str(host).unwrap(),
-        );
     }
 }
 
@@ -770,5 +763,63 @@ pub fn body_to_json(request: &reqwest::Request) -> Option<serde_json::Value> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::{
+        matchers::{header, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn server(url: &str) -> Server {
+        Server {
+            id: 1,
+            name: "Images".into(),
+            url: url::Url::parse(url).unwrap(),
+            priority: 100,
+            media_streaming_mode: crate::config::MediaStreamingMode::Redirect,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Upstream 22aacd8: the incoming Host header must not reach the backend
+    /// (it dropped the port) nor follow redirects to an external image host.
+    #[tokio::test]
+    async fn host_header_follows_the_target_url_and_redirects() {
+        let state = crate::handlers::quick_connect::tests::create_test_app_state().await;
+        let (upstream, images) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("GET"))
+            .and(path("/Items/x/Images/Primary"))
+            .and(header("host", upstream.address().to_string().as_str()))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/poster.jpg", images.uri())),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/poster.jpg"))
+            .and(header("host", images.address().to_string().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"poster"))
+            .expect(1)
+            .mount(&images)
+            .await;
+
+        let mut request = reqwest::Client::new()
+            .get(format!("{}/Items/x/Images/Primary", upstream.uri()))
+            .header(reqwest::header::HOST, "jellyswarrm.example.com")
+            .build()
+            .unwrap();
+        apply_to_request(&mut request, &server(&upstream.uri()), &None, &None, &state).await;
+        assert!(!request.headers().contains_key(reqwest::header::HOST));
+
+        let response = reqwest::Client::new().execute(request).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"poster");
     }
 }
