@@ -98,6 +98,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Per-IP auth rate limit for a request from `peer` (see `client_ip`).
+    pub async fn auth_rate_ok(
+        &self,
+        peer: std::net::SocketAddr,
+        headers: &http::HeaderMap,
+    ) -> bool {
+        let trusted = self.config.read().await.trusted_proxies.clone();
+        self.auth_rate_limiter
+            .check(rate_limiter::client_ip(peer, headers, &trusted))
+            .await
+    }
+
     pub fn new(
         reqwest_client: reqwest::Client,
         streaming_reqwest_client: reqwest::Client,
@@ -866,12 +878,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal(
-            deletion_task.abort_handle(),
-            revival_task.abort_handle(),
-        ))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(
+        deletion_task.abort_handle(),
+        revival_task.abort_handle(),
+    ))
+    .await?;
 
     deletion_task.await??;
     Ok(())

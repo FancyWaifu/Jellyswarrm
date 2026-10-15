@@ -6,7 +6,12 @@ use governor::{
     Quota, RateLimiter,
 };
 use moka::future::Cache;
-use std::{net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
+    sync::Arc,
+    time::Duration,
+};
 use tracing::warn;
 
 /// Per-IP rate limiter for authentication endpoints
@@ -68,28 +73,29 @@ impl AuthRateLimiter {
     }
 }
 
-/// Extract client IP from headers, falling back to UNSPECIFIED for direct
-/// connections so they share a global limiter bucket.
-pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> IpAddr {
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(xff_str) = xff.to_str() {
-            if let Some(first_ip) = xff_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                    return ip;
-                }
-            }
-        }
+/// The IP to rate-limit on. The TCP peer is authoritative. Forwarding headers
+/// are only believed when the peer is a configured `trusted_proxies` entry, and
+/// then only the *rightmost* hop — the one that proxy appended. Everything left
+/// of it is client-controlled and trivially spoofed.
+pub fn client_ip(
+    peer: SocketAddr,
+    headers: &axum::http::HeaderMap,
+    trusted_proxies: &[IpAddr],
+) -> IpAddr {
+    let peer_ip = peer.ip().to_canonical();
+    if !trusted_proxies.contains(&peer_ip) {
+        return peer_ip;
     }
-
-    if let Some(real_ip) = headers.get("x-real-ip") {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                return ip;
-            }
-        }
-    }
-
-    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    let header_ip = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
+    };
+    header_ip("x-forwarded-for")
+        .or_else(|| header_ip("x-real-ip"))
+        .unwrap_or(peer_ip)
 }
 
 #[cfg(test)]
@@ -127,5 +133,24 @@ mod tests {
         assert!(limiter.check(ip2).await);
         assert!(!limiter.check(ip1).await);
         assert!(!limiter.check(ip2).await);
+    }
+
+    #[test]
+    fn client_ip_ignores_spoofable_headers() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", "1.2.3.4, 9.9.9.9".parse().unwrap());
+        let proxy: SocketAddr = "172.18.0.2:5000".parse().unwrap();
+        // Untrusted peer (even a private one): headers are ignored entirely.
+        assert_eq!(client_ip(proxy, &h, &[]), proxy.ip());
+        // Trusted proxy: only the rightmost (proxy-appended) hop counts.
+        assert_eq!(
+            client_ip(proxy, &h, &[proxy.ip()]),
+            "9.9.9.9".parse::<IpAddr>().unwrap()
+        );
+        // Trusted proxy, no headers: the peer itself.
+        assert_eq!(
+            client_ip(proxy, &Default::default(), &[proxy.ip()]),
+            proxy.ip()
+        );
     }
 }

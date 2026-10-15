@@ -359,6 +359,12 @@ pub struct AppConfig {
     /// priority backend that has it. Opt-in; default false.
     #[serde(default)]
     pub dedup_movies: bool,
+
+    /// Reverse proxies whose `X-Forwarded-For` is believed for per-IP auth rate
+    /// limiting (like Jellyfin's "Known proxies"). Empty = rate-limit on the TCP
+    /// peer, so everyone behind an unlisted proxy shares one bucket.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 fn default_watched_sync_retry_interval_secs() -> u64 {

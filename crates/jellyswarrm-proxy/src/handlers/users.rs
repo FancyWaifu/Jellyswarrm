@@ -1,5 +1,7 @@
+use std::net::SocketAddr;
+
 use axum::{
-    extract::{Path, Request, State},
+    extract::{ConnectInfo, Path, Request, State},
     Json,
 };
 use hyper::{HeaderMap, StatusCode};
@@ -9,7 +11,6 @@ use crate::{
     encryption::Password,
     handlers::common::execute_json_request,
     models::{AuthenticateRequest, AuthenticateResponse, Authorization, SyncPlayUserAccessType},
-    rate_limiter::extract_client_ip,
     request_preprocessing::preprocess_request,
     url_helper::join_server_url,
     validation::{validate_password, validate_username},
@@ -106,11 +107,11 @@ pub async fn handle_get_user_by_id(
 // Authenticates a user by trying all configured servers in parallel
 pub async fn handle_authenticate_by_name(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<AuthenticateRequest>,
 ) -> Result<Json<AuthenticateResponse>, StatusCode> {
-    let client_ip = extract_client_ip(&headers);
-    if !state.auth_rate_limiter.check(client_ip).await {
+    if !state.auth_rate_ok(peer, &headers).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
