@@ -245,6 +245,12 @@ pub struct UserAuthorizationService {
     token_key: MappingEncryptionKey,
 }
 
+/// Mappings are keyed by the server URL without surrounding whitespace or
+/// trailing slashes, so `http://x` and `http://x/` are one mapping.
+fn canonical_server_url(server_url: &str) -> &str {
+    server_url.trim().trim_end_matches('/')
+}
+
 /// `credential_format` of mappings encrypted with `mapping_key`.
 const MAPPING_FORMAT_V2: &str = "v2";
 
@@ -489,6 +495,7 @@ impl UserAuthorizationService {
         mapped_username: &str,
         mapped_password: &Password,
     ) -> Result<i64, sqlx::Error> {
+        let server_url = canonical_server_url(server_url);
         let now = chrono::Utc::now();
 
         let existing_mapping = self.get_server_mapping(user_id, server_url).await?;
@@ -710,6 +717,7 @@ impl UserAuthorizationService {
         user_id: &str,
         server_url: &str,
     ) -> Result<Option<ServerMapping>, sqlx::Error> {
+        let server_url = canonical_server_url(server_url);
         let mapping = sqlx::query_as::<_, ServerMapping>(
             r#"
             SELECT id, user_id, server_url, mapped_username, mapped_password, credential_format, created_at, updated_at
@@ -1363,6 +1371,71 @@ mod tests {
                 .as_str(),
             "backendpw"
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_mapping_urls_merge_and_stay_merged() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let svc = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
+        let user = svc.create_user("dana", &"pw".into()).await.unwrap();
+        // Pre-fix state: same server stored with and without a trailing slash.
+        let mut ids = vec![];
+        for (url, fmt, updated) in [
+            ("http://s", "legacy", "2026-01-01T00:00:00Z"),
+            ("http://s/", "v2", "2026-02-01T00:00:00Z"),
+        ] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO server_mappings (user_id, server_url, mapped_username, mapped_password, credential_format, updated_at) VALUES (?, ?, 'u', 'x', ?, ?) RETURNING id",
+            )
+            .bind(&user.id).bind(url).bind(fmt).bind(updated)
+            .fetch_one(&pool).await.unwrap();
+            ids.push(id);
+        }
+        let (old, new) = (ids[0], ids[1]);
+        // d1 has a session on both rows (would collide after the move); d2 only on the old row.
+        for (mapping, device) in [(old, "d1"), (new, "d1"), (old, "d2")] {
+            sqlx::query("INSERT INTO authorization_sessions (user_id, mapping_id, server_url, client, device, device_id, version, jellyfin_token, original_user_id) VALUES (?, ?, 'http://s', 'c', 'd', ?, '1', 't', 'o')")
+                .bind(&user.id).bind(mapping).bind(device).execute(&pool).await.unwrap();
+        }
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261016120000_canonical_mapping_urls.up.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT id, server_url, credential_format FROM server_mappings")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(new, "http://s".to_string(), "v2".to_string())]);
+        let mut sessions: Vec<(i64, String)> =
+            sqlx::query_as("SELECT mapping_id, device_id FROM authorization_sessions")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        sessions.sort();
+        assert_eq!(sessions, vec![(new, "d1".into()), (new, "d2".into())]);
+
+        // Writes and lookups with either spelling hit the same row.
+        assert_eq!(
+            svc.add_server_mapping(&user.id, "http://s/", "u2", &"p".into())
+                .await
+                .unwrap(),
+            new
+        );
+        assert_eq!(
+            svc.get_server_mapping(&user.id, " http://s// ")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            new
+        );
+        assert_eq!(svc.list_server_mappings(&user.id).await.unwrap().len(), 1);
     }
 
     /// Every legacy shape the fork could have stored, upgraded at startup.
