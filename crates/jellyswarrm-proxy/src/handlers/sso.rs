@@ -217,6 +217,7 @@ pub async fn handle_sso_callback(
         issuer: claims.issuer.clone(),
         subject: claims.subject.clone(),
         email: claims.email.clone(),
+        preferred_username: claims.preferred_username.clone(),
         failed_attempts: 0,
     };
     session
@@ -233,6 +234,8 @@ struct PendingLink {
     issuer: String,
     subject: String,
     email: Option<String>,
+    #[serde(default)]
+    preferred_username: Option<String>,
     #[serde(default)]
     failed_attempts: u32,
 }
@@ -289,6 +292,7 @@ pub async fn handle_sso_link(
             &pending.issuer,
             &pending.subject,
             pending.email.as_deref(),
+            pending.preferred_username.as_deref(),
         )
         .await?;
         let _ = session.remove::<PendingLink>(PENDING_KEY).await;
@@ -369,8 +373,9 @@ async fn provision_new_user(
     issuer: &str,
     subject: &str,
     email: Option<&str>,
+    preferred_username: Option<&str>,
 ) -> Result<crate::user_authorization_service::User, HandlerError> {
-    let base = derive_username(&email.map(|s| s.to_string()), subject);
+    let base = derive_username(email, preferred_username, subject);
     let mut username = base.clone();
     let mut attempt = 0u32;
     loop {
@@ -516,11 +521,12 @@ pub async fn sso_inject_js() -> impl IntoResponse {
 
 /// Derive a backend username from the email local-part (preferred) or subject,
 /// restricted to a safe character set.
-fn derive_username(email: &Option<String>, subject: &str) -> String {
+/// Email local part, else `preferred_username`, else the (often opaque) subject.
+fn derive_username(email: Option<&str>, preferred_username: Option<&str>, subject: &str) -> String {
     let raw = email
-        .as_deref()
         .and_then(|e| e.split('@').next())
         .filter(|s| !s.is_empty())
+        .or(preferred_username.filter(|s| !s.trim().is_empty()))
         .unwrap_or(subject);
     let cleaned: String = raw
         .chars()
@@ -606,4 +612,24 @@ fn link_page(email: Option<&str>, auto_provision: bool) -> String {
         email = esc(email.unwrap_or("your SSO account")),
         create_section = create_section
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_prefers_email_then_preferred_username_then_subject() {
+        let sub = "3d145c3a-7a31-4977-a423-5f4b8d65a3bd";
+        assert_eq!(
+            derive_username(Some("new@aut.test"), Some("autnew"), sub),
+            "new"
+        );
+        assert_eq!(derive_username(None, Some("autnew"), sub), "autnew");
+        assert_eq!(derive_username(None, Some("  "), sub), sub);
+        assert_eq!(derive_username(None, None, sub), sub);
+        // IdP-controlled values are sanitized to a safe character set.
+        assert_eq!(derive_username(None, Some("../evil <b>"), sub), "..evilb");
+        assert_eq!(derive_username(None, Some("ü"), "ü"), "sso-ü");
+    }
 }

@@ -12,8 +12,8 @@ use std::time::Duration;
 use moka::future::Cache;
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, TokenResponse,
+    AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, TokenResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,8 @@ pub struct OidcClaims {
     pub issuer: String,
     pub subject: String,
     pub email: Option<String>,
+    /// Only used to suggest a username for auto-provisioned accounts.
+    pub preferred_username: Option<String>,
 }
 
 /// Minimal id-token claims for the lenient fallback path. Only the fields we
@@ -66,6 +68,8 @@ struct LenientIdClaims {
     sub: String,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    preferred_username: Option<String>,
     #[serde(default)]
     nonce: Option<String>,
 }
@@ -217,11 +221,36 @@ impl OidcService {
             .claims(&verifier, &nonce)
             .map_err(|e| OidcError::Claims(e.to_string()))?;
 
-        Ok(OidcClaims {
+        let mut out = OidcClaims {
             issuer: claims.issuer().as_str().to_string(),
             subject: claims.subject().as_str().to_string(),
             email: claims.email().map(|e| e.as_str().to_string()),
-        })
+            preferred_username: claims.preferred_username().map(|u| u.as_str().to_string()),
+        };
+        // Some IdPs (e.g. Authelia 4.39 by default) keep profile claims out of the
+        // ID token. Ask the userinfo endpoint so provisioned accounts get a
+        // readable name instead of the opaque subject. Best-effort: identity is
+        // already established; openidconnect rejects a userinfo `sub` mismatch.
+        if out.email.is_none() && out.preferred_username.is_none() {
+            match client.user_info(
+                token_response.access_token().clone(),
+                Some(claims.subject().clone()),
+            ) {
+                Ok(req) => match req
+                    .request_async::<openidconnect::EmptyAdditionalClaims, _, openidconnect::core::CoreGenderClaim>(&self.http_client)
+                    .await
+                {
+                    Ok(info) => {
+                        out.email = info.email().map(|e| e.as_str().to_string());
+                        out.preferred_username =
+                            info.preferred_username().map(|u| u.as_str().to_string());
+                    }
+                    Err(e) => tracing::debug!("OIDC userinfo request failed: {}", e),
+                },
+                Err(e) => tracing::debug!("OIDC provider has no userinfo endpoint: {}", e),
+            }
+        }
+        Ok(out)
     }
 
     /// Lenient ID-token validation for non-spec-compliant IdPs whose token
@@ -288,6 +317,7 @@ impl OidcService {
             issuer: data.claims.iss,
             subject: data.claims.sub,
             email: data.claims.email,
+            preferred_username: data.claims.preferred_username,
         })
     }
 }
