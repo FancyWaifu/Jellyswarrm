@@ -377,13 +377,13 @@ pub fn decrypt_password_with_key_material(
     let combined = general_purpose::STANDARD
         .decode(encrypted_data.as_str())
         .map_err(|e| {
-            tracing::error!("Base64 decoding failed: {}", e);
+            tracing::debug!("Base64 decoding failed: {}", e);
             EncryptionError::Base64DecodeFailed(e)
         })?;
 
     // Extract nonce (first 12 bytes) and ciphertext (remaining bytes)
     if combined.len() < 12 {
-        tracing::error!(
+        tracing::debug!(
             "Invalid nonce size: expected at least 12 bytes, got {}",
             combined.len()
         );
@@ -399,7 +399,7 @@ pub fn decrypt_password_with_key_material(
 
     // Decrypt the ciphertext
     let plaintext_bytes = cipher.decrypt(nonce, ciphertext).map_err(|e| {
-        tracing::error!("Decryption failed: {}", e);
+        tracing::debug!("Decryption failed: {}", e);
         EncryptionError::PasswordDecryptionFailed
     })?;
 
