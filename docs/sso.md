@@ -67,6 +67,12 @@ entirely while ② keeps working from stored, Jellyswarrm-owned credentials.
 
 ## 3. The credential re-key (the one architectural change)
 
+> **Superseded.** All mappings — password, admin-created and SSO — are now
+> encrypted with a key derived from the persisted `session_key` (not from any
+> password), so no re-key is needed when an SSO identity is linked. Existing
+> rows are upgraded at startup. See [reverse-proxy.md](reverse-proxy.md#back-up-the-session-key).
+> The text below is the original design note.
+
 Today a user's `server_mappings.mapped_password` is encrypted with **the user's own
 password** (`federated_users.rs:194` → `add_server_mapping(..., Some(&password.into()))`),
 so decrypting it at request time requires that password. An SSO user never supplies

@@ -96,7 +96,7 @@ Once the container is running, open:
 
 * **Bundled Jellyfin Web Client:** `http://[JELLYSWARRM_HOST]:[JELLYSWARRM_PORT]`
 
-For advanced configuration options, check out the [ui](./docs/ui.md) and [configuration](./docs/config.md) documentation.
+For advanced configuration options, check out the [ui](./docs/ui.md) and [configuration](./docs/config.md) documentation. Running behind a reverse proxy, Cloudflare or with SSO? See [reverse proxy, HTTPS & SSO](./docs/reverse-proxy.md).
 
 ---
 
