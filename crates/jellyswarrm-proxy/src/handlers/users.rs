@@ -170,6 +170,19 @@ pub async fn handle_authenticate_by_name(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    // An existing user must prove their local password before their stored
+    // backend credentials are used. Admin- and SSO-created mappings decrypt
+    // without it, so a backend accepting them proves nothing about the caller.
+    if let Some(user) = &existing_user {
+        if !user.original_password_hash.verify(payload.password.as_str()) {
+            warn!(
+                "Rejecting login for existing user '{}': wrong local password",
+                payload.username
+            );
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
     let is_existing_user = existing_user.is_some();
 
     if let Some(user) = existing_user {
