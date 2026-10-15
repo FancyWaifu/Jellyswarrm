@@ -113,6 +113,7 @@ ENV RUST_LOG=info
 # Install minimal runtime dependencies
 RUN apk add --no-cache \
 	ca-certificates \
+	curl \
 	sqlite-libs \
 	&& update-ca-certificates
 
@@ -120,6 +121,11 @@ RUN apk add --no-cache \
 COPY --from=rust-build /app/jellyswarrm-proxy /app/jellyswarrm-proxy
 
 EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:${JELLYSWARRM_PORT:-3000}/health" > /dev/null \
+        && curl --fail --silent --show-error --max-time 3 "http://127.0.0.1:${JELLYSWARRM_PORT:-3000}/ready" > /dev/null \
+        || exit 1
 
 ENTRYPOINT ["/app/jellyswarrm-proxy"]
 
