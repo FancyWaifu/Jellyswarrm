@@ -382,7 +382,10 @@ pub async fn handle_quick_connect_authorize(
         .get_user_by_virtual_key(&token)
         .await
         .map_err(|e| {
-            warn!("Quick Connect authorize: failed to resolve user from token: {}", e);
+            warn!(
+                "Quick Connect authorize: failed to resolve user from token: {}",
+                e
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or_else(|| {

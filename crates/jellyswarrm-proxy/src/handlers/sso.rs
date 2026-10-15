@@ -143,11 +143,8 @@ pub async fn handle_sso_callback(
         .state
         .ok_or((StatusCode::BAD_REQUEST, "missing 'state'".to_string()))?;
 
-    let login_state: OidcLoginState = session
-        .get(SSO_STATE_KEY)
-        .await
-        .map_err(internal)?
-        .ok_or((
+    let login_state: OidcLoginState =
+        session.get(SSO_STATE_KEY).await.map_err(internal)?.ok_or((
             StatusCode::BAD_REQUEST,
             "no SSO login in progress (session expired?) — start again".to_string(),
         ))?;
@@ -172,7 +169,10 @@ pub async fn handle_sso_callback(
         .map_err(|e| {
             // Detail (token-endpoint URL, claim values) stays in logs only.
             error!("OIDC complete_login failed: {}", e);
-            (StatusCode::UNAUTHORIZED, "SSO validation failed".to_string())
+            (
+                StatusCode::UNAUTHORIZED,
+                "SSO validation failed".to_string(),
+            )
         })?;
 
     // Email is PII — keep it out of info-level logs.
@@ -216,7 +216,10 @@ pub async fn handle_sso_callback(
         subject: claims.subject.clone(),
         email: claims.email.clone(),
     };
-    session.insert(PENDING_KEY, &pending).await.map_err(internal)?;
+    session
+        .insert(PENDING_KEY, &pending)
+        .await
+        .map_err(internal)?;
     let auto = state.config.read().await.oidc_auto_provision;
     Ok(Html(link_page(claims.email.as_deref(), auto)).into_response())
 }
@@ -245,14 +248,10 @@ pub async fn handle_sso_link(
     session: Session,
     Form(form): Form<LinkForm>,
 ) -> Result<Response, HandlerError> {
-    let pending: PendingLink = session
-        .get(PENDING_KEY)
-        .await
-        .map_err(internal)?
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            "no SSO login in progress (session expired?) — start again".to_string(),
-        ))?;
+    let pending: PendingLink = session.get(PENDING_KEY).await.map_err(internal)?.ok_or((
+        StatusCode::BAD_REQUEST,
+        "no SSO login in progress (session expired?) — start again".to_string(),
+    ))?;
 
     let (sid, sname) = {
         let c = state.config.read().await;
@@ -262,7 +261,10 @@ pub async fn handle_sso_link(
     // Create-new branch (auto-provision).
     if form.create.as_deref() == Some("1") {
         if !state.config.read().await.oidc_auto_provision {
-            return Err((StatusCode::FORBIDDEN, "account creation is disabled".to_string()));
+            return Err((
+                StatusCode::FORBIDDEN,
+                "account creation is disabled".to_string(),
+            ));
         }
         let user = provision_new_user(
             &state,
@@ -324,7 +326,13 @@ pub async fn handle_sso_link(
         );
         match state
             .user_authorization
-            .add_server_mapping(&user.id, &m.server_url, &m.mapped_username, &plain, Some(&master_key))
+            .add_server_mapping(
+                &user.id,
+                &m.server_url,
+                &m.mapped_username,
+                &plain,
+                Some(&master_key),
+            )
             .await
         {
             Ok(_) => rekeyed += 1,
@@ -334,7 +342,12 @@ pub async fn handle_sso_link(
 
     state
         .oidc_storage
-        .link_identity(&user.id, &pending.issuer, &pending.subject, pending.email.as_deref())
+        .link_identity(
+            &user.id,
+            &pending.issuer,
+            &pending.subject,
+            pending.email.as_deref(),
+        )
         .await
         .map_err(internal)?;
     let _ = session.remove::<PendingLink>(PENDING_KEY).await;
@@ -379,7 +392,9 @@ async fn provision_new_user(
         }
         attempt += 1;
         if attempt > 6 {
-            return Err(internal("could not allocate a unique username for SSO user"));
+            return Err(internal(
+                "could not allocate a unique username for SSO user",
+            ));
         }
         let mut h = Sha256::new();
         h.update(issuer.as_bytes());
@@ -428,7 +443,11 @@ pub struct ProviderInfo {
 }
 
 pub async fn list_sso_providers(State(state): State<AppState>) -> impl IntoResponse {
-    match state.oidc_storage.list_enabled_providers_with_server().await {
+    match state
+        .oidc_storage
+        .list_enabled_providers_with_server()
+        .await
+    {
         Ok(ps) => Json(
             ps.into_iter()
                 .map(|p| ProviderInfo {
@@ -535,7 +554,12 @@ fn esc(s: &str) -> String {
 /// Completes login by writing the jellyfin-web credential store (so the served
 /// web client auto-connects) and redirecting into the app. Replaces the old
 /// token-display page.
-fn login_complete_page(server_id: &str, server_name: &str, user_id: &str, token: &str) -> Html<String> {
+fn login_complete_page(
+    server_id: &str,
+    server_name: &str,
+    user_id: &str,
+    token: &str,
+) -> Html<String> {
     // serde_json escapes the values safely; replace `<` to prevent a `</script>`
     // breakout from any free-text (server_name).
     let creds = serde_json::json!({

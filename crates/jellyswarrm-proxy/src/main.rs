@@ -51,9 +51,9 @@ use backend_health::BackendHealth;
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
 use media_storage_service::MediaStorageService;
-use rate_limiter::AuthRateLimiter;
 use oidc::OidcService;
 use oidc_storage::OidcStorageService;
+use rate_limiter::AuthRateLimiter;
 use server_storage::ServerStorageService;
 use user_authorization_service::UserAuthorizationService;
 
@@ -373,8 +373,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match encryption::encrypt_password(&admin_pass.clone().into(), &master_key) {
                     Ok(enc) => {
-                        if let Err(e) =
-                            server_storage.add_server_admin(server.id, admin_user, &enc).await
+                        if let Err(e) = server_storage
+                            .add_server_admin(server.id, admin_user, &enc)
+                            .await
                         {
                             error!("Failed to seed admin creds for {}: {}", pre.name, e);
                         } else {
@@ -963,19 +964,20 @@ async fn proxy_handler(
     let method = preprocessed.request.method().clone();
     // Played/favorite carry the (already id-mapped) item in the path, and the route
     // followed that item, so the routed backend owns it.
-    let path_item: Option<String> = if matches!(
-        method,
-        reqwest::Method::POST | reqwest::Method::DELETE
-    ) {
-        watched_sync::played_item_id_from_path(request_url.path())
-            .or_else(|| watched_sync::favorite_item_id_from_path(request_url.path()))
-            .map(str::to_string)
-    } else {
-        None
-    };
-    let is_playing_report = method == reqwest::Method::POST
-        && watched_sync::is_playing_report_path(request_url.path());
-    let playing_is_stopped = request_url.path().trim_end_matches('/').ends_with("/Stopped");
+    let path_item: Option<String> =
+        if matches!(method, reqwest::Method::POST | reqwest::Method::DELETE) {
+            watched_sync::played_item_id_from_path(request_url.path())
+                .or_else(|| watched_sync::favorite_item_id_from_path(request_url.path()))
+                .map(str::to_string)
+        } else {
+            None
+        };
+    let is_playing_report =
+        method == reqwest::Method::POST && watched_sync::is_playing_report_path(request_url.path());
+    let playing_is_stopped = request_url
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/Stopped");
     // For playback reports we capture the *virtual* ItemId + position from the body
     // (below) and resolve its owning backend ourselves — the request may be routed
     // to a different backend (a version-picker source), so we can't trust the
@@ -1061,9 +1063,7 @@ async fn proxy_handler(
                         .get_media_mapping_with_server(&virtual_item)
                         .await
                     {
-                        Ok(Some((mapping, server))) => {
-                            Some((server.id, mapping.original_media_id))
-                        }
+                        Ok(Some((mapping, server))) => Some((server.id, mapping.original_media_id)),
                         _ => {
                             debug!("sync: no media mapping for {virtual_item}; skipping");
                             None

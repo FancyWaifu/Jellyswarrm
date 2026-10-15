@@ -393,7 +393,10 @@ impl FederatedUserService {
                 .find(|u| u.name.eq_ignore_ascii_case(username))
                 .map(|u| u.id.clone());
             if existing_remote_id.is_none() {
-                if let Err(e) = admin_client.create_user(username, Some(password.as_str())).await {
+                if let Err(e) = admin_client
+                    .create_user(username, Some(password.as_str()))
+                    .await
+                {
                     results.push(ServerSyncResult {
                         server_name: server.name.clone(),
                         status: SyncStatus::Failed,
@@ -452,8 +455,9 @@ impl FederatedUserService {
                         "SSO user '{}' on {}: resetting password for Jellyswarrm-managed account",
                         username, server.name
                     );
-                    if let Err(e) =
-                        admin_client.set_user_password(remote_id, password.as_str()).await
+                    if let Err(e) = admin_client
+                        .set_user_password(remote_id, password.as_str())
+                        .await
                     {
                         warn!("admin password reset failed on {}: {}", server.name, e);
                     } else {
@@ -656,7 +660,10 @@ impl FederatedUserService {
     /// stale tokens left over from prior logins heal automatically — without the
     /// re-auth storm that deleting sessions + lazy-recreating would cause against
     /// federated peers. Returns the number of sessions refreshed.
-    pub async fn refresh_user_sessions(&self, user: &crate::user_authorization_service::User) -> usize {
+    pub async fn refresh_user_sessions(
+        &self,
+        user: &crate::user_authorization_service::User,
+    ) -> usize {
         let sessions = match self
             .user_authorization
             .get_user_sessions(&user.id, None)
@@ -702,7 +709,8 @@ impl FederatedUserService {
                     None,
                     None,
                 );
-                let Ok(client) = JellyfinClient::new(server.url.as_str(), client_info.clone()) else {
+                let Ok(client) = JellyfinClient::new(server.url.as_str(), client_info.clone())
+                else {
                     continue;
                 };
                 match client

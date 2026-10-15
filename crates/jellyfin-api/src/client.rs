@@ -308,8 +308,7 @@ impl JellyfinClient {
             let series_id = v.get("SeriesId").and_then(|s| s.as_str());
             if let (Some(season), Some(episode), Some(series_id)) = (season, episode, series_id) {
                 let sp = format!("Users/{user_id}/Items/{series_id}?Fields=ProviderIds");
-                let sv: serde_json::Value =
-                    self.request(reqwest::Method::GET, &sp, None).await?;
+                let sv: serde_json::Value = self.request(reqwest::Method::GET, &sp, None).await?;
                 return Ok((
                     MatchKey::Episode {
                         series: providers_from(sv.get("ProviderIds")),
@@ -320,7 +319,10 @@ impl JellyfinClient {
                 ));
             }
         }
-        Ok((MatchKey::Provider(providers_from(v.get("ProviderIds"))), user_data))
+        Ok((
+            MatchKey::Provider(providers_from(v.get("ProviderIds"))),
+            user_data,
+        ))
     }
 
     /// An item's `IndexNumber` (e.g. a Season's number), or `None` if absent.
@@ -697,7 +699,10 @@ impl MatchKey {
 }
 
 fn provider_key_str(p: &[(String, String)]) -> String {
-    let mut v: Vec<String> = p.iter().map(|(k, val)| format!("{}.{val}", k.to_lowercase())).collect();
+    let mut v: Vec<String> = p
+        .iter()
+        .map(|(k, val)| format!("{}.{val}", k.to_lowercase()))
+        .collect();
     v.sort();
     v.join(",")
 }
@@ -779,9 +784,15 @@ mod tests {
         let items = vec![
             json!({"Id":"sibling","ProviderIds":{"Imdb":"tt9999999","TmdbCollection":"131292"}}),
         ];
-        assert_eq!(first_provider_match(&items, &want(&[("TmdbCollection", "131292")])), None);
         assert_eq!(
-            first_provider_match(&items, &want(&[("Imdb", "tt0371746"), ("TmdbCollection", "131292")])),
+            first_provider_match(&items, &want(&[("TmdbCollection", "131292")])),
+            None
+        );
+        assert_eq!(
+            first_provider_match(
+                &items,
+                &want(&[("Imdb", "tt0371746"), ("TmdbCollection", "131292")])
+            ),
             None
         );
     }
@@ -792,24 +803,39 @@ mod tests {
             json!({"Id":"a","ProviderIds":{"Imdb":"tt1"}}),
             json!({"Id":"b","ProviderIds":{"Tmdb":"22"}}),
         ];
-        assert_eq!(first_provider_match(&items, &want(&[("Tmdb", "22")])).as_deref(), Some("b"));
+        assert_eq!(
+            first_provider_match(&items, &want(&[("Tmdb", "22")])).as_deref(),
+            Some("b")
+        );
         // case-insensitive key
-        assert_eq!(first_provider_match(&items, &want(&[("tmdb", "22")])).as_deref(), Some("b"));
-        assert_eq!(first_provider_match(&items, &want(&[("Imdb", "nope")])), None);
+        assert_eq!(
+            first_provider_match(&items, &want(&[("tmdb", "22")])).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            first_provider_match(&items, &want(&[("Imdb", "nope")])),
+            None
+        );
     }
 
     #[test]
     fn tolerates_malformed_items() {
         let items = vec![
             json!({"Id":"noproviders"}),
-            json!({"ProviderIds":{"Imdb":"tt1"}}),            // matches but has no Id
+            json!({"ProviderIds":{"Imdb":"tt1"}}), // matches but has no Id
             json!({"Id":"nullval","ProviderIds":{"Imdb":null,"Tmdb":5}}), // non-string values
             json!("not even an object"),
             json!({"Id":"good","ProviderIds":{"Imdb":"tt7"}}),
         ];
-        assert_eq!(first_provider_match(&items, &want(&[("Imdb", "tt7")])).as_deref(), Some("good"));
+        assert_eq!(
+            first_provider_match(&items, &want(&[("Imdb", "tt7")])).as_deref(),
+            Some("good")
+        );
         // a matching item with no Id is skipped, nothing else matches tt1 -> None
-        assert_eq!(first_provider_match(&items, &want(&[("Imdb", "tt1")])), None);
+        assert_eq!(
+            first_provider_match(&items, &want(&[("Imdb", "tt1")])),
+            None
+        );
         // empty input
         assert_eq!(first_provider_match(&[], &want(&[("Imdb", "tt7")])), None);
     }

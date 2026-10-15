@@ -82,7 +82,11 @@ async fn get_items_from_all_servers_inner(
     // content: filter the fan-out to it and skip merge/dedup so its libraries and
     // items pass through verbatim.
     let scope = scope_server_id(&req);
-    let parent_override = if scope.is_some() { None } else { parent_override };
+    let parent_override = if scope.is_some() {
+        None
+    } else {
+        parent_override
+    };
 
     let (original_request, _, _, sessions, _) =
         extract_request_infos(req, &state).await.map_err(|e| {
@@ -186,11 +190,10 @@ async fn get_items_from_all_servers_inner(
             )
             .await;
 
-            let inner_call =
-                execute_json_request::<crate::models::ItemsResponseVariants>(
-                    &state_clone.reqwest_client,
-                    request,
-                );
+            let inner_call = execute_json_request::<crate::models::ItemsResponseVariants>(
+                &state_clone.reqwest_client,
+                request,
+            );
 
             let result = match tokio::time::timeout(DEFAULT_BACKEND_TIMEOUT, inner_call).await {
                 Err(_) => {
@@ -323,7 +326,10 @@ async fn get_items_from_all_servers_inner(
         let merged = dedup_and_register_series(&state, merged).await;
         dedup_movies_by_provider(merged)
     } else {
-        interleaved_items.into_iter().map(|(item, _)| item).collect()
+        interleaved_items
+            .into_iter()
+            .map(|(item, _)| item)
+            .collect()
     };
 
     let count = interleaved_items.len();
@@ -440,7 +446,9 @@ fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
     use BaseItemKind::*;
     // Normalized, suffix-stripped title.
     let title = || -> Option<String> {
-        let n = strip_server_suffix(item.name.as_deref()?).trim().to_lowercase();
+        let n = strip_server_suffix(item.name.as_deref()?)
+            .trim()
+            .to_lowercase();
         (!n.is_empty()).then_some(n)
     };
     let extra_lc = |k: &str| -> String {
@@ -489,7 +497,10 @@ fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
                 .and_then(|v| v.as_i64())
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            Some(format!("{:?}#{artist}|{album}|{track}|{title}", item.item_type))
+            Some(format!(
+                "{:?}#{artist}|{album}|{track}|{title}",
+                item.item_type
+            ))
         }
         _ => None,
     }
@@ -553,9 +564,7 @@ async fn dedup_and_register_series(
 /// single list — used to clean up duplicate FILES inside one backend's library
 /// (the cross-backend fan-out already dedups; the single-backend `get_items` path
 /// didn't). All items share one priority, so the first occurrence is kept.
-pub fn dedup_leaf_items(
-    items: Vec<crate::models::MediaItem>,
-) -> Vec<crate::models::MediaItem> {
+pub fn dedup_leaf_items(items: Vec<crate::models::MediaItem>) -> Vec<crate::models::MediaItem> {
     dedup_movies_by_provider(items.into_iter().map(|i| (i, 0)).collect())
 }
 
@@ -691,10 +700,11 @@ async fn fanout_series_children(
     members: Vec<(i64, String)>,
     is_episodes: bool,
 ) -> Result<Json<crate::models::ItemsResponseVariants>, StatusCode> {
-    let (original_request, _, _, sessions, _) = extract_request_infos(req, &state).await.map_err(|e| {
-        error!("series fanout preprocess: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
+    let (original_request, _, _, sessions, _) =
+        extract_request_infos(req, &state).await.map_err(|e| {
+            error!("series fanout preprocess: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
     let sessions = sessions.ok_or(StatusCode::UNAUTHORIZED)?;
 
     // If the client asked for a specific season (by the canonical `seasonId`),
@@ -809,8 +819,20 @@ fn dedup_children_by_number(
     }
     // Order seasons/episodes by their number for a sensible display.
     out.sort_by_key(|(it, _)| {
-        let s = num(it, if is_episodes { "ParentIndexNumber" } else { "IndexNumber" }).unwrap_or(0);
-        let e = if is_episodes { num(it, "IndexNumber").unwrap_or(0) } else { 0 };
+        let s = num(
+            it,
+            if is_episodes {
+                "ParentIndexNumber"
+            } else {
+                "IndexNumber"
+            },
+        )
+        .unwrap_or(0);
+        let e = if is_episodes {
+            num(it, "IndexNumber").unwrap_or(0)
+        } else {
+            0
+        };
         (s, e)
     });
     out.into_iter().map(|(it, _)| it).collect()
@@ -1153,7 +1175,10 @@ mod dedup_tests {
 
     #[test]
     fn strip_server_suffix_cases() {
-        assert_eq!(strip_server_suffix("Education Section [Travis jellyfin]"), "Education Section");
+        assert_eq!(
+            strip_server_suffix("Education Section [Travis jellyfin]"),
+            "Education Section"
+        );
         assert_eq!(strip_server_suffix("Media [Whiskey jellyfin]"), "Media");
         assert_eq!(strip_server_suffix("Movies"), "Movies");
         // Names without a trailing "]" are untouched (only runs on library tiles).
@@ -1175,7 +1200,7 @@ mod dedup_tests {
     #[test]
     fn keeps_highest_priority_copy_and_passes_through_rest() {
         let items = vec![
-            (movie("a-lo", Some("tt1")), 50), // Movies2-ish (lower)
+            (movie("a-lo", Some("tt1")), 50),  // Movies2-ish (lower)
             (movie("a-hi", Some("tt1")), 100), // Movies (higher)
             (movie("b", Some("tt2")), 50),     // unique movie
             (movie("c-noid", None), 50),       // movie w/o provider id -> kept
@@ -1191,11 +1216,14 @@ mod dedup_tests {
         // Episodes imported as provider-less movies in a mixed "Media" library:
         // no ids, no series/episode — the same file name on two backends must
         // still collapse (by normalized title), while a different title is kept.
-        let mut a: MediaItem = serde_json::from_value(serde_json::json!({"Id":"a","Type":"Movie"})).unwrap();
+        let mut a: MediaItem =
+            serde_json::from_value(serde_json::json!({"Id":"a","Type":"Movie"})).unwrap();
         a.name = Some("Squid Game - S02E07 - Friend or Foe [Whiskey jellyfin]".into());
-        let mut b: MediaItem = serde_json::from_value(serde_json::json!({"Id":"b","Type":"Movie"})).unwrap();
+        let mut b: MediaItem =
+            serde_json::from_value(serde_json::json!({"Id":"b","Type":"Movie"})).unwrap();
         b.name = Some("Squid Game - S02E07 - Friend or Foe [Stephans jellyfin]".into());
-        let mut c: MediaItem = serde_json::from_value(serde_json::json!({"Id":"c","Type":"Movie"})).unwrap();
+        let mut c: MediaItem =
+            serde_json::from_value(serde_json::json!({"Id":"c","Type":"Movie"})).unwrap();
         c.name = Some("Love Death and Robots S04E01 [Whiskey jellyfin]".into());
         let out = dedup_movies_by_provider(vec![(a, 100), (b, 50), (c, 50)]);
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
@@ -1213,10 +1241,27 @@ mod dedup_tests {
             m
         };
         let items = vec![
-            (audio("a", "Today [Whiskey jellyfin]", "Smashing Pumpkins", "Gish"), 100),
-            (audio("b", "Today [Paw jellyfin]", "Smashing Pumpkins", "Gish"), 50), // dup
-            (audio("c", "Today [Whiskey jellyfin]", "Willow", "Today"), 50),       // diff artist -> kept
-            (audio("d", "Heart-Shaped Box [Whiskey jellyfin]", "Nirvana", "In Utero"), 50),
+            (
+                audio("a", "Today [Whiskey jellyfin]", "Smashing Pumpkins", "Gish"),
+                100,
+            ),
+            (
+                audio("b", "Today [Paw jellyfin]", "Smashing Pumpkins", "Gish"),
+                50,
+            ), // dup
+            (
+                audio("c", "Today [Whiskey jellyfin]", "Willow", "Today"),
+                50,
+            ), // diff artist -> kept
+            (
+                audio(
+                    "d",
+                    "Heart-Shaped Box [Whiskey jellyfin]",
+                    "Nirvana",
+                    "In Utero",
+                ),
+                50,
+            ),
         ];
         let out = dedup_movies_by_provider(items);
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
@@ -1232,9 +1277,15 @@ mod dedup_tests {
             m
         };
         let items = vec![
-            (leaf("a", "Book", "The Holy Bible KJV [Whiskey jellyfin]"), 100),
+            (
+                leaf("a", "Book", "The Holy Bible KJV [Whiskey jellyfin]"),
+                100,
+            ),
             (leaf("b", "Book", "The Holy Bible KJV [Rhens jellyfin]"), 50), // dup -> collapse
-            (leaf("c", "Book", "Dungeon Crawler Carl [Whiskey jellyfin]"), 50), // distinct
+            (
+                leaf("c", "Book", "Dungeon Crawler Carl [Whiskey jellyfin]"),
+                50,
+            ), // distinct
             (leaf("d", "Photo", "IMG_100 [Whiskey jellyfin]"), 50),
             (leaf("e", "Photo", "IMG_100 [Rhens jellyfin]"), 50), // dup photo -> collapse
         ];
@@ -1258,8 +1309,14 @@ mod dedup_tests {
         // Same episode (no episode-level provider id) on two backends, tagged with
         // the proxy's [server] suffix — must collapse by series+season+episode.
         let items = vec![
-            (episode("ep-whiskey", "Desmond's [Whiskey jellyfin]", 1, 3), 100),
-            (episode("ep-stephans", "Desmond's [Stephans jellyfin]", 1, 3), 50),
+            (
+                episode("ep-whiskey", "Desmond's [Whiskey jellyfin]", 1, 3),
+                100,
+            ),
+            (
+                episode("ep-stephans", "Desmond's [Stephans jellyfin]", 1, 3),
+                50,
+            ),
             (episode("other", "Desmond's [Whiskey jellyfin]", 1, 4), 50), // diff episode -> kept
         ];
         let out = dedup_movies_by_provider(items);

@@ -77,7 +77,9 @@ pub async fn should_sync_position(
         return false;
     }
     if final_stop || position_ticks - furthest >= POSITION_SYNC_THRESHOLD_TICKS {
-        LAST_SYNC_POS.insert(key, position_ticks.max(furthest)).await;
+        LAST_SYNC_POS
+            .insert(key, position_ticks.max(furthest))
+            .await;
         return true;
     }
     false
@@ -188,7 +190,13 @@ pub async fn fan_out(
             PeerOutcome::Failed => {
                 warn!("sync: '{}' unreachable; queued for retry", server.name);
                 queue
-                    .enqueue(&session.user_id, server.id, &title_key, &match_key, &user_data)
+                    .enqueue(
+                        &session.user_id,
+                        server.id,
+                        &title_key,
+                        &match_key,
+                        &user_data,
+                    )
                     .await;
             }
         }
@@ -238,7 +246,10 @@ async fn sync_one_peer(
         Ok(()) => {
             info!(
                 "sync: applied userdata (played={}, pos={}, fav={}) on '{}' (item {peer_item_id})",
-                user_data.played, user_data.playback_position_ticks, user_data.is_favorite, server.name
+                user_data.played,
+                user_data.playback_position_ticks,
+                user_data.is_favorite,
+                server.name
             );
             PeerOutcome::Synced
         }
@@ -444,7 +455,8 @@ async fn drain_queue(
             }
             Err(_) => continue,
         };
-        let Some((session, server)) = sessions.into_iter().find(|(_, s)| s.id == e.server_id) else {
+        let Some((session, server)) = sessions.into_iter().find(|(_, s)| s.id == e.server_id)
+        else {
             // no session on this backend right now -> count an attempt and move on
             queue.bump(e.id).await;
             continue;
@@ -477,14 +489,20 @@ mod tests {
             favorite_item_id_from_path("/Users/abc/FavoriteItems/xyz"),
             Some("xyz")
         );
-        assert_eq!(played_item_id_from_path("/Users/abc/FavoriteItems/xyz"), None);
+        assert_eq!(
+            played_item_id_from_path("/Users/abc/FavoriteItems/xyz"),
+            None
+        );
     }
 
     #[test]
     fn rejects_unrelated_paths() {
         assert_eq!(played_item_id_from_path("/Users/abc/Items/xyz"), None);
         assert_eq!(played_item_id_from_path("/Users/abc/PlayedItems/"), None);
-        assert_eq!(played_item_id_from_path("/Users/abc/PlayedItems/x/extra"), None);
+        assert_eq!(
+            played_item_id_from_path("/Users/abc/PlayedItems/x/extra"),
+            None
+        );
         assert_eq!(played_item_id_from_path("/System/Info"), None);
     }
 

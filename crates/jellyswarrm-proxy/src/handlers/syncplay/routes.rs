@@ -179,10 +179,7 @@ async fn user_has_library_access(
 }
 
 /// The set of backend server URLs the given user currently has sessions on.
-async fn user_server_urls(
-    state: &AppState,
-    user_id: &str,
-) -> Result<HashSet<String>, StatusCode> {
+async fn user_server_urls(state: &AppState, user_id: &str) -> Result<HashSet<String>, StatusCode> {
     let sessions = state
         .user_authorization
         .get_user_sessions_by_user_id(user_id)

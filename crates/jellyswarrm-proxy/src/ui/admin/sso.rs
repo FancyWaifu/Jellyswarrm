@@ -142,7 +142,15 @@ pub async fn add_provider(
     let server_id = match form.server_id.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(s) => match s.parse::<i64>() {
-            Ok(id) if state.server_storage.get_server_by_id(id).await.ok().flatten().is_some() => {
+            Ok(id)
+                if state
+                    .server_storage
+                    .get_server_by_id(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some() =>
+            {
                 Some(id)
             }
             _ => {

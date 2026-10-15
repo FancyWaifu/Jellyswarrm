@@ -84,10 +84,7 @@ impl BackendHealth {
     pub async fn is_ejected(&self, server_id: i64) -> bool {
         let now = Instant::now();
         let mut guard = self.inner.write().await;
-        guard
-            .entry(server_id)
-            .or_default()
-            .is_ejected(now)
+        guard.entry(server_id).or_default().is_ejected(now)
     }
 
     /// Record a successful fanout call. Pulls the backend out of ejection if
@@ -208,10 +205,7 @@ pub fn spawn_revival_probe(
                         health.record_success(server.id, &server.name).await;
                     }
                     Err(e) => {
-                        debug!(
-                            "Revival probe: '{}' still unhealthy: {}",
-                            server.name, e
-                        );
+                        debug!("Revival probe: '{}' still unhealthy: {}", server.name, e);
                     }
                 }
             }

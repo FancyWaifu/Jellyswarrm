@@ -342,6 +342,10 @@ mod tests {
             .unwrap();
         assert_eq!(got.user_id, "user-1");
         // same subject under a different issuer is a distinct identity
-        assert!(s.get_identity("https://other/", "sub-abc").await.unwrap().is_none());
+        assert!(s
+            .get_identity("https://other/", "sub-abc")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

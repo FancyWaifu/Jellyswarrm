@@ -34,7 +34,8 @@ pub async fn get_item(
     match execute_json_request::<MediaItem>(&state.reqwest_client, preprocessed.request).await {
         Ok(media_item) => {
             let server_id = { state.config.read().await.server_id.clone() };
-            let mut item = process_media_item(media_item, &state, &server, false, &server_id).await?;
+            let mut item =
+                process_media_item(media_item, &state, &server, false, &server_id).await?;
             // With dedup on, expose the same movie/episode on other backends as
             // selectable "versions" (MediaSources), so the user can pick which
             // server to stream from.
@@ -113,8 +114,7 @@ async fn aggregate_versions(
             else {
                 return;
             };
-            let Some(home_client) =
-                version_client(home_server, &home_session.jellyfin_token).await
+            let Some(home_client) = version_client(home_server, &home_session.jellyfin_token).await
             else {
                 return;
             };
@@ -317,8 +317,7 @@ pub async fn pin_to_media_source(state: &AppState, req: Request) -> Request {
         }
     }
 
-    if let (Some(msid), Some(item_id)) =
-        (msid.filter(|s| !s.is_empty()), item_segment(&full_path))
+    if let (Some(msid), Some(item_id)) = (msid.filter(|s| !s.is_empty()), item_segment(&full_path))
     {
         if msid != item_id {
             let src_srv = state

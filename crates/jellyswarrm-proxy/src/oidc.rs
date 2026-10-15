@@ -210,9 +210,7 @@ impl OidcService {
             Err(e) => return Err(OidcError::Exchange(e.to_string())),
         };
 
-        let id_token = token_response
-            .id_token()
-            .ok_or(OidcError::MissingIdToken)?;
+        let id_token = token_response.id_token().ok_or(OidcError::MissingIdToken)?;
         let verifier = client.id_token_verifier();
         let nonce = Nonce::new(state.nonce.clone());
         let claims = id_token
