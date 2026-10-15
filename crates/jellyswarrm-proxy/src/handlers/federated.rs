@@ -985,19 +985,44 @@ async fn dedup_and_register_views(
 
 /// Pull the `X-Debug-Key` header out as an owned string (so nothing borrowing the
 /// non-`Sync` request is held across an await in the handler).
-fn debug_key(req: &Request) -> Option<String> {
-    req.headers()
+/// `X-Debug-Key`, peer and headers, pulled out synchronously (a `&Request`
+/// can't be held across an await in a handler).
+fn debug_creds(req: &Request) -> (Option<String>, std::net::SocketAddr, axum::http::HeaderMap) {
+    let key = req
+        .headers()
         .get("X-Debug-Key")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+        .map(str::to_string);
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0)
+        .unwrap_or_else(|| ([0, 0, 0, 0], 0).into());
+    (key, peer, req.headers().clone())
 }
 
-/// True if `key` matches the configured master password.
-async fn debug_password_ok(state: &AppState, key: Option<&str>) -> bool {
-    match key {
-        Some(k) => k == state.config.read().await.password.as_str(),
-        None => false,
+/// True if `key` is the master password. Shares the per-IP auth limiter (this
+/// is a master-password oracle otherwise) and compares digests so timing
+/// doesn't leak the password prefix.
+async fn debug_password_ok(
+    state: &AppState,
+    (key, peer, headers): (Option<String>, std::net::SocketAddr, axum::http::HeaderMap),
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let Some(key) = key else {
+        return false;
+    };
+    if !state.auth_rate_ok(peer, &headers).await {
+        return false;
     }
+    let expected = Sha256::digest(state.config.read().await.password.as_str().as_bytes());
+    let given = Sha256::digest(key.as_bytes());
+    // Fixed-length digests, no early exit.
+    expected
+        .iter()
+        .zip(given.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// `GET /_debug/viewmerge` — dump the in-memory view-merge registry (canonical
@@ -1008,8 +1033,8 @@ pub async fn debug_viewmerge(
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let key = debug_key(&req);
-    if !debug_password_ok(&state, key.as_deref()).await {
+    let creds = debug_creds(&req);
+    if !debug_password_ok(&state, creds).await {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let groups: Vec<serde_json::Value> = state
@@ -1042,8 +1067,8 @@ pub async fn debug_explain(
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let key = debug_key(&req);
-    if !debug_password_ok(&state, key.as_deref()).await {
+    let creds = debug_creds(&req);
+    if !debug_password_ok(&state, creds).await {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let parent_id = req.uri().query().and_then(parent_id_from_query);
