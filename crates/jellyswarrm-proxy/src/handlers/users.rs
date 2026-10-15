@@ -174,7 +174,10 @@ pub async fn handle_authenticate_by_name(
     // backend credentials are used. Admin- and SSO-created mappings decrypt
     // without it, so a backend accepting them proves nothing about the caller.
     if let Some(user) = &existing_user {
-        if !user.original_password_hash.verify(payload.password.as_str()) {
+        if !user
+            .original_password_hash
+            .verify(payload.password.as_str())
+        {
             warn!(
                 "Rejecting login for existing user '{}': wrong local password",
                 payload.username
@@ -282,14 +285,7 @@ pub async fn handle_authenticate_by_name(
         let user =
             resolve_or_create_login_user(&state, &payload.username, &payload.password).await?;
 
-        persist_successful_auths(
-            &state,
-            &user,
-            &payload.password,
-            &authentication,
-            &successful_auths,
-        )
-        .await?;
+        persist_successful_auths(&state, &user, &authentication, &successful_auths).await?;
 
         let auth_response =
             decorate_auth_response(&state, &user, &payload.username, &successful_auths[0]).await;
@@ -322,7 +318,6 @@ async fn resolve_or_create_login_user(
 async fn persist_successful_auths(
     state: &AppState,
     user: &crate::user_authorization_service::User,
-    login_password: &Password,
     login_authorization: &Authorization,
     successful_auths: &[SuccessfulServerAuth],
 ) -> Result<(), StatusCode> {
@@ -334,7 +329,6 @@ async fn persist_successful_auths(
                 successful.server.url.as_str(),
                 &successful.final_username,
                 &successful.final_password,
-                Some(&login_password.clone().into()),
             )
             .await
             .map_err(|e| {
@@ -402,21 +396,15 @@ async fn authenticate_on_server(
     );
 
     // Get user mapping for this server
-    let config = state.config.read().await;
-    let admin_password = &config.password;
-
-    let given_password = payload.password.clone();
+    let admin_password = state.get_admin_password().await;
 
     let (final_username, final_password) = if let Some(mapping) = &server_mapping {
         (
             mapping.mapped_username.clone(),
-            state.user_authorization.decrypt_server_mapping_password(
-                mapping,
-                &given_password.clone().into(),
-                &admin_password.into(),
-                Some(&given_password),
-                Some(admin_password),
-            ),
+            state
+                .user_authorization
+                .decrypt_server_mapping_password(mapping, Some(&payload.password), &admin_password)
+                .map_err(|_| AuthError::InternalError)?,
         )
     } else {
         (payload.username.clone(), payload.password.clone())

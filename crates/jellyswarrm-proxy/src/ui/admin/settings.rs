@@ -96,10 +96,18 @@ pub async fn save_settings(
 }
 
 pub async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
-    let new_cfg = crate::config::load_config();
-    {
-        let mut cfg = state.config.write().await;
-        *cfg = new_cfg;
+    let mut cfg = state.config.write().await;
+    match crate::config::load_config_with_session_key(Some(&cfg.session_key)) {
+        Ok(new_cfg) => {
+            *cfg = new_cfg;
+            Html("<div class=\"alert\">Configuration reloaded</div>".to_string())
+        }
+        Err(e) => {
+            error!("Config reload failed: {:#}", e);
+            Html(
+                "<div class=\"alert\">Reload failed (see logs); keeping the running configuration</div>"
+                    .to_string(),
+            )
+        }
     }
-    Html("<div class=\"alert\">Configuration reloaded</div>")
 }

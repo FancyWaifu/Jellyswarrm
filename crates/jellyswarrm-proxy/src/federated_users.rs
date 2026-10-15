@@ -186,13 +186,7 @@ impl FederatedUserService {
                     if should_map {
                         if let Err(e) = self
                             .user_authorization
-                            .add_server_mapping(
-                                user_id,
-                                server.url.as_str(),
-                                username,
-                                password,
-                                Some(&password.into()), // Encrypt with their own password so they can use it
-                            )
+                            .add_server_mapping(user_id, server.url.as_str(), username, password)
                             .await
                         {
                             error!(
@@ -234,7 +228,6 @@ impl FederatedUserService {
                                     server.url.as_str(),
                                     username,
                                     password,
-                                    Some(&password.into()), // Encrypt with their own password so they can use it
                                 )
                                 .await
                             {
@@ -489,13 +482,7 @@ impl FederatedUserService {
             // Store the mapping (master-key encrypted) + an initial session.
             if let Err(e) = self
                 .user_authorization
-                .add_server_mapping(
-                    user_id,
-                    server.url.as_str(),
-                    username,
-                    password,
-                    Some(&master_key),
-                )
+                .add_server_mapping(user_id, server.url.as_str(), username, password)
                 .await
             {
                 results.push(ServerSyncResult {
@@ -576,10 +563,7 @@ impl FederatedUserService {
         };
         let (admin_master, client_info) = {
             let config = self.config.read().await;
-            (
-                Into::<HashedPassword>::into(config.password.clone()),
-                crate::config::CLIENT_INFO.clone(),
-            )
+            (config.password.clone(), crate::config::CLIENT_INFO.clone())
         };
 
         let mut created = 0usize;
@@ -592,13 +576,14 @@ impl FederatedUserService {
 
             // Master-key encrypted for SSO users; user-password for legacy. The
             // decrypt helper tries the user hash then falls back to the master key.
-            let decrypted = self.user_authorization.decrypt_server_mapping_password(
+            let decrypted = match self.user_authorization.decrypt_server_mapping_password(
                 &mapping,
-                &user.original_password_hash,
+                None,
                 &admin_master,
-                None,
-                None,
-            );
+            ) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
 
             let client = match JellyfinClient::new(server.url.as_str(), client_info.clone()) {
                 Ok(c) => c,
@@ -684,10 +669,7 @@ impl FederatedUserService {
         };
         let (master_key, client_info) = {
             let config = self.config.read().await;
-            (
-                Into::<HashedPassword>::into(config.password.clone()),
-                crate::config::CLIENT_INFO.clone(),
-            )
+            (config.password.clone(), crate::config::CLIENT_INFO.clone())
         };
 
         let norm = |u: &str| u.trim_end_matches('/').to_string();
@@ -702,13 +684,13 @@ impl FederatedUserService {
                 let Some(mapping) = mappings.iter().find(|m| norm(&m.server_url) == key) else {
                     continue;
                 };
-                let decrypted = self.user_authorization.decrypt_server_mapping_password(
+                let Ok(decrypted) = self.user_authorization.decrypt_server_mapping_password(
                     mapping,
-                    &user.original_password_hash,
+                    None,
                     &master_key,
-                    None,
-                    None,
-                );
+                ) else {
+                    continue;
+                };
                 let Ok(client) = JellyfinClient::new(server.url.as_str(), client_info.clone())
                 else {
                     continue;

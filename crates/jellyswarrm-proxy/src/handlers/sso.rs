@@ -329,43 +329,15 @@ pub async fn handle_sso_link(
         ));
     };
 
-    // Re-key the user's backend mappings: decrypt with their password, re-encrypt
-    // under the master key so password-less SSO logins can use them.
+    // Mappings are stored under the server key, so SSO logins can use them
+    // without this password. Upgrade any legacy ones it still unlocks.
     let password: Password = password_str.as_str().into();
-    let user_key: HashedPassword = (&password).into();
-    let master_key: HashedPassword = {
-        let c = state.config.read().await;
-        c.password.clone().into()
-    };
-    let mappings = state
+    let admin_password = state.get_admin_password().await;
+    let upgraded = state
         .user_authorization
-        .list_server_mappings(&user.id)
+        .upgrade_legacy_mappings_with_password(&user.id, &password, &admin_password)
         .await
         .map_err(internal)?;
-    let mut rekeyed = 0;
-    for m in &mappings {
-        let plain = state.user_authorization.decrypt_server_mapping_password(
-            m,
-            &user_key,
-            &master_key,
-            Some(&password),
-            None,
-        );
-        match state
-            .user_authorization
-            .add_server_mapping(
-                &user.id,
-                &m.server_url,
-                &m.mapped_username,
-                &plain,
-                Some(&master_key),
-            )
-            .await
-        {
-            Ok(_) => rekeyed += 1,
-            Err(e) => error!("re-key mapping failed for {}: {}", m.server_url, e),
-        }
-    }
 
     state
         .oidc_storage
@@ -380,13 +352,8 @@ pub async fn handle_sso_link(
     let _ = session.remove::<PendingLink>(PENDING_KEY).await;
 
     info!(
-        "Linked SSO identity ({}, {}) -> user '{}' ({}); re-keyed {}/{} mappings",
-        pending.issuer,
-        pending.subject,
-        user.original_username,
-        user.id,
-        rekeyed,
-        mappings.len()
+        "Linked SSO identity ({}, {}) -> user '{}' ({}); upgraded {} legacy mappings",
+        pending.issuer, pending.subject, user.original_username, user.id, upgraded
     );
 
     // Heal any stale tokens on the freshly-linked account's existing sessions.

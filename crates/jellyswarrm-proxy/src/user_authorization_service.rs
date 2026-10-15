@@ -3,8 +3,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::MediaStreamingMode;
 use crate::encryption::{
-    decrypt_password, decrypt_password_with_key_material, encrypt_password, EncryptedPassword,
-    HashedPassword, Password,
+    decrypt_password_with_key_material, is_legacy_plaintext, EncryptedPassword, EncryptionError,
+    HashedPassword, MappingEncryptionKey, Password,
 };
 use crate::models::{generate_token, Authorization};
 use crate::server_storage::Server;
@@ -26,6 +26,8 @@ pub struct ServerMapping {
     pub server_url: String,
     pub mapped_username: String,
     pub mapped_password: EncryptedPassword,
+    /// `legacy` (password/admin-key encrypted, or plaintext) or `v2` (server key).
+    pub credential_format: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -239,11 +241,41 @@ impl AuthorizationSession {
 #[derive(Debug, Clone)]
 pub struct UserAuthorizationService {
     pool: SqlitePool,
+    mapping_key: MappingEncryptionKey,
+    token_key: MappingEncryptionKey,
+}
+
+/// `credential_format` of mappings encrypted with `mapping_key`.
+const MAPPING_FORMAT_V2: &str = "v2";
+
+/// Try the legacy schemes: AES key = SHA-256 of each key material (a stored
+/// SHA-256 password hash, or a raw password for the oldest rows).
+fn legacy_decrypt(value: &EncryptedPassword, key_materials: &[&str]) -> Option<Password> {
+    key_materials
+        .iter()
+        .find_map(|k| decrypt_password_with_key_material(value, k).ok())
+}
+
+/// Legacy key materials derivable from plaintext passwords.
+fn legacy_keys_for(passwords: &[&Password]) -> Vec<String> {
+    passwords
+        .iter()
+        .flat_map(|p| {
+            [
+                HashedPassword::from_password(p.as_str()).into_inner(),
+                p.as_str().to_string(),
+            ]
+        })
+        .collect()
 }
 
 impl UserAuthorizationService {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, session_key: &[u8]) -> Result<Self, EncryptionError> {
+        Ok(Self {
+            pool,
+            mapping_key: MappingEncryptionKey::for_server_mappings(session_key)?,
+            token_key: MappingEncryptionKey::for_authorization_sessions(session_key)?,
+        })
     }
 
     fn normalized_username_key(username: &str) -> String {
@@ -430,41 +462,32 @@ impl UserAuthorizationService {
         Ok(user)
     }
 
-    /// Add or update server mapping for a user
+    /// Add or update server mapping for a user (always stored under the server key).
     pub async fn add_server_mapping(
         &self,
         user_id: &str,
         server_url: &str,
         mapped_username: &str,
         mapped_password: &Password,
-        master_password: Option<&HashedPassword>,
     ) -> Result<i64, sqlx::Error> {
         let now = chrono::Utc::now();
 
         let existing_mapping = self.get_server_mapping(user_id, server_url).await?;
 
-        // When a key is provided, NEVER silently downgrade to plaintext on an
-        // encryption error — a secret stored in the clear is worse than a failed
-        // mapping, so propagate the error. (Audit finding H1.) The `None` branch
-        // is an explicit keyless path used only by tests; production callers
-        // always supply the master/user key.
-        let final_password = if let Some(master) = master_password {
-            encrypt_password(mapped_password, master).map_err(|e| {
-                sqlx::Error::Protocol(format!("failed to encrypt server mapping password: {e}"))
-            })?
-        } else {
-            warn!("No encryption key provided for server mapping; storing plaintext (test path)");
-            EncryptedPassword::from_raw(mapped_password.as_str().into())
-        };
+        // Never fall back to storing plaintext on an encryption error.
+        let final_password = self.mapping_key.encrypt(mapped_password).map_err(|e| {
+            sqlx::Error::Protocol(format!("failed to encrypt server mapping password: {e}"))
+        })?;
 
         sqlx::query(
             r#"
             INSERT INTO server_mappings
-            (user_id, server_url, mapped_username, mapped_password, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (user_id, server_url, mapped_username, mapped_password, credential_format, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, server_url) DO UPDATE SET
                 mapped_username = excluded.mapped_username,
                 mapped_password = excluded.mapped_password,
+                credential_format = excluded.credential_format,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -472,6 +495,7 @@ impl UserAuthorizationService {
         .bind(server_url)
         .bind(mapped_username)
         .bind(final_password)
+        .bind(MAPPING_FORMAT_V2)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -512,51 +536,153 @@ impl UserAuthorizationService {
         Ok(mapping_id)
     }
 
-    /// Decrypt a server mapping password
+    /// Decrypt a server mapping password.
+    ///
+    /// `v2` rows must decrypt with the server key (an error means a wrong or
+    /// lost `session_key`; the ciphertext is never sent as a password). Legacy
+    /// rows that no known key opens are returned as-is: they are plaintext or
+    /// unverifiable, and callers only re-save (upgrade) them after a backend
+    /// accepted the value.
     pub fn decrypt_server_mapping_password(
         &self,
         mapping: &ServerMapping,
-        user_password: &HashedPassword,
-        admin_password: &HashedPassword,
         user_password_plain: Option<&Password>,
-        admin_password_plain: Option<&Password>,
-    ) -> Password {
-        // Try user password first
-        if let Ok(decrypted) = decrypt_password(&mapping.mapped_password, user_password) {
-            return decrypted;
+        admin_password_plain: &Password,
+    ) -> Result<Password, EncryptionError> {
+        if mapping.credential_format == MAPPING_FORMAT_V2 {
+            return self
+                .mapping_key
+                .decrypt(&mapping.mapped_password)
+                .inspect_err(|e| {
+                    error!(
+                        "Cannot decrypt server mapping {} (was session_key changed?): {}",
+                        mapping.id, e
+                    )
+                });
         }
-
-        // Try admin password
-        if let Ok(decrypted) = decrypt_password(&mapping.mapped_password, admin_password) {
-            return decrypted;
+        let passwords: Vec<&Password> = user_password_plain
+            .into_iter()
+            .chain([admin_password_plain])
+            .collect();
+        let keys = legacy_keys_for(&passwords);
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        if let Some(p) = legacy_decrypt(&mapping.mapped_password, &keys) {
+            return Ok(p);
         }
-
-        // Backward compatibility: try raw user password key material if available
-        if let Some(user_password_plain) = user_password_plain {
-            if let Ok(decrypted) = decrypt_password_with_key_material(
-                &mapping.mapped_password,
-                user_password_plain.as_str(),
-            ) {
-                return decrypted;
-            }
-        }
-
-        // Backward compatibility: try raw admin password key material if available
-        if let Some(admin_password_plain) = admin_password_plain {
-            if let Ok(decrypted) = decrypt_password_with_key_material(
-                &mapping.mapped_password,
-                admin_password_plain.as_str(),
-            ) {
-                return decrypted;
-            }
-        }
-
-        // If decryption fails, assume it's plaintext (legacy or fallback)
         warn!(
-            "Failed to decrypt password for mapping {}. Assuming plaintext.",
+            "Legacy mapping {} did not decrypt with any known key; treating it as plaintext",
             mapping.id
         );
-        mapping.mapped_password.clone().into_inner().into()
+        Ok(mapping.mapped_password.clone().into_inner().into())
+    }
+
+    /// Store a legacy mapping's verified plaintext under the server key.
+    async fn upgrade_mapping<'e, E: sqlx::SqliteExecutor<'e>>(
+        &self,
+        executor: E,
+        mapping_id: i64,
+        password: &Password,
+    ) -> Result<(), sqlx::Error> {
+        let encrypted = self
+            .mapping_key
+            .encrypt(password)
+            .map_err(|e| sqlx::Error::Protocol(format!("encryption failed: {e}")))?;
+        sqlx::query(
+            "UPDATE server_mappings SET mapped_password = ?, credential_format = ? WHERE id = ?",
+        )
+        .bind(encrypted)
+        .bind(MAPPING_FORMAT_V2)
+        .bind(mapping_id)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
+    /// One-time startup upgrade of legacy credentials to the server key.
+    ///
+    /// Mappings opened by the owner's stored SHA-256 hash or the admin password
+    /// (or stored as plaintext) are re-encrypted now, before any login can
+    /// replace that hash. Ambiguous rows stay `legacy` until a login supplies the
+    /// user's password or a backend accepts them. Plaintext session tokens are
+    /// encrypted. Returns (upgraded mappings, still-legacy mappings, tokens).
+    pub async fn migrate_legacy_credentials(
+        &self,
+        admin_password: &Password,
+    ) -> Result<(usize, usize, usize), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"SELECT m.id, m.mapped_password, u.original_password_hash
+               FROM server_mappings m JOIN users u ON u.id = m.user_id
+               WHERE m.credential_format != ?"#,
+        )
+        .bind(MAPPING_FORMAT_V2)
+        .fetch_all(&mut *tx)
+        .await?;
+        let admin_keys = legacy_keys_for(&[admin_password]);
+        let (mut upgraded, mut ambiguous) = (0, 0);
+        for row in rows {
+            let id: i64 = row.get("id");
+            let value = EncryptedPassword::from_raw(row.get("mapped_password"));
+            let user_hash: String = row.get("original_password_hash");
+            let keys: Vec<&str> = std::iter::once(user_hash.as_str())
+                .chain(admin_keys.iter().map(String::as_str))
+                .collect();
+            let plain = legacy_decrypt(&value, &keys)
+                .or_else(|| is_legacy_plaintext(&value).then(|| value.as_str().into()));
+            match plain {
+                Some(p) => {
+                    self.upgrade_mapping(&mut *tx, id, &p).await?;
+                    upgraded += 1;
+                }
+                None => ambiguous += 1,
+            }
+        }
+
+        let tokens = sqlx::query("SELECT id, jellyfin_token FROM authorization_sessions")
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut encrypted_tokens = 0;
+        for row in tokens {
+            let token: String = row.get("jellyfin_token");
+            if MappingEncryptionKey::is_encrypted_token(&token) {
+                continue;
+            }
+            let enc = self
+                .token_key
+                .encrypt_token(&token)
+                .map_err(|e| sqlx::Error::Protocol(format!("encryption failed: {e}")))?;
+            sqlx::query("UPDATE authorization_sessions SET jellyfin_token = ? WHERE id = ?")
+                .bind(enc)
+                .bind(row.get::<i64, _>("id"))
+                .execute(&mut *tx)
+                .await?;
+            encrypted_tokens += 1;
+        }
+        tx.commit().await?;
+        Ok((upgraded, ambiguous, encrypted_tokens))
+    }
+
+    /// Upgrade a user's remaining legacy mappings that their (verified) plaintext
+    /// password or the admin password opens. Returns how many were upgraded.
+    pub async fn upgrade_legacy_mappings_with_password(
+        &self,
+        user_id: &str,
+        password: &Password,
+        admin_password: &Password,
+    ) -> Result<usize, sqlx::Error> {
+        let keys = legacy_keys_for(&[password, admin_password]);
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut upgraded = 0;
+        for m in self.list_server_mappings(user_id).await? {
+            if m.credential_format == MAPPING_FORMAT_V2 {
+                continue;
+            }
+            if let Some(p) = legacy_decrypt(&m.mapped_password, &keys) {
+                self.upgrade_mapping(&self.pool, m.id, &p).await?;
+                upgraded += 1;
+            }
+        }
+        Ok(upgraded)
     }
 
     /// Get server mapping
@@ -567,7 +693,7 @@ impl UserAuthorizationService {
     ) -> Result<Option<ServerMapping>, sqlx::Error> {
         let mapping = sqlx::query_as::<_, ServerMapping>(
             r#"
-            SELECT id, user_id, server_url, mapped_username, mapped_password, created_at, updated_at
+            SELECT id, user_id, server_url, mapped_username, mapped_password, credential_format, created_at, updated_at
             FROM server_mappings
             WHERE user_id = ? AND server_url = ?
             "#,
@@ -587,7 +713,7 @@ impl UserAuthorizationService {
     ) -> Result<Vec<ServerMapping>, sqlx::Error> {
         let mappings = sqlx::query_as::<_, ServerMapping>(
             r#"
-            SELECT id, user_id, server_url, mapped_username, mapped_password, created_at, updated_at
+            SELECT id, user_id, server_url, mapped_username, mapped_password, credential_format, created_at, updated_at
             FROM server_mappings
             WHERE user_id = ?
             ORDER BY server_url
@@ -632,7 +758,11 @@ impl UserAuthorizationService {
         .bind(&authorization.device)
         .bind(&authorization.device_id)
         .bind(&authorization.version)
-        .bind(jellyfin_token)
+        .bind(
+            self.token_key
+                .encrypt_token(&jellyfin_token)
+                .map_err(|e| sqlx::Error::Protocol(format!("token encryption failed: {e}")))?,
+        )
         .bind(original_user_id)
         .bind(expires_at)
         .bind(now)
@@ -738,7 +868,23 @@ impl UserAuthorizationService {
 
         let sessions: Vec<(AuthorizationSession, Server)> = rows
             .into_iter()
-            .map(|row| {
+            .filter_map(|row| {
+                let jellyfin_token = match self
+                    .token_key
+                    .decrypt_token(&row.get::<String, _>("jellyfin_token"))
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // Unusable without the key that wrote it; skip, the
+                        // client re-authenticates.
+                        warn!(
+                            "Skipping session {} with undecryptable token: {}",
+                            row.get::<i64, _>("auth_id"),
+                            e
+                        );
+                        return None;
+                    }
+                };
                 let device = Device {
                     client: row.get("client"),
                     device: row.get("device"),
@@ -751,7 +897,7 @@ impl UserAuthorizationService {
                     mapping_id: row.get("auth_mapping_id"),
                     server_url: row.get("auth_server_url"),
                     device,
-                    jellyfin_token: row.get("jellyfin_token"),
+                    jellyfin_token,
                     original_user_id: row.get("original_user_id"),
                     expires_at: row.get("expires_at"),
                     created_at: row.get("auth_created_at"),
@@ -771,7 +917,7 @@ impl UserAuthorizationService {
                     updated_at: row.get("server_updated_at"),
                 };
 
-                (auth_session, server)
+                Some((auth_session, server))
             })
             .collect();
 
@@ -973,7 +1119,8 @@ impl UserAuthorizationService {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Update user password and re-encrypt server mappings
+    /// Update a user's password. Server-key mappings don't depend on it; legacy
+    /// mappings the old password opens are upgraded first so none are stranded.
     pub async fn update_user_password(
         &self,
         user_id: &str,
@@ -981,12 +1128,10 @@ impl UserAuthorizationService {
         new_password: &Password,
         admin_password: &Password,
     ) -> Result<bool, sqlx::Error> {
-        let mut transaction = self.pool.begin().await?;
+        self.upgrade_legacy_mappings_with_password(user_id, old_password, admin_password)
+            .await?;
 
-        // 1. Update user password hash
         let password_hash: HashedPassword = new_password.into();
-        let now = chrono::Utc::now();
-
         let res = sqlx::query(
             r#"
             UPDATE users
@@ -995,68 +1140,12 @@ impl UserAuthorizationService {
             "#,
         )
         .bind(password_hash)
-        .bind(now)
+        .bind(chrono::Utc::now())
         .bind(user_id)
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await?;
 
-        if res.rows_affected() == 0 {
-            return Ok(false);
-        }
-
-        // 2. Re-encrypt all server mappings
-        let mappings = sqlx::query_as::<_, ServerMapping>(
-            r#"
-            SELECT id, user_id, server_url, mapped_username, mapped_password, created_at, updated_at
-            FROM server_mappings
-            WHERE user_id = ?
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-
-        let old_password_hash = old_password.into();
-        let admin_password_hash = admin_password.into();
-
-        for mapping in mappings {
-            // Decrypt with old credentials
-            let decrypted_password = self.decrypt_server_mapping_password(
-                &mapping,
-                &old_password_hash,
-                &admin_password_hash,
-                Some(old_password),
-                Some(admin_password),
-            );
-
-            // Encrypt with new password
-            let new_encrypted_password =
-                match encrypt_password(&decrypted_password, &new_password.into()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!("Failed to encrypt password during update: {}", e);
-                        return Err(sqlx::Error::Protocol(format!("Encryption failed: {}", e)));
-                    }
-                };
-
-            // Update mapping in DB
-            sqlx::query(
-                r#"
-                UPDATE server_mappings
-                SET mapped_password = ?, updated_at = ?
-                WHERE id = ?
-                "#,
-            )
-            .bind(new_encrypted_password)
-            .bind(now)
-            .bind(mapping.id)
-            .execute(&mut *transaction)
-            .await?;
-        }
-
-        transaction.commit().await?;
-
-        Ok(true)
+        Ok(res.rows_affected() > 0)
     }
 
     /// Verify user password
@@ -1169,6 +1258,153 @@ mod tests {
 
     use super::*;
 
+    /// Every legacy shape the fork could have stored, upgraded at startup.
+    #[tokio::test]
+    async fn legacy_credentials_migrate_to_server_key() {
+        use crate::encryption::{encrypt_password, HashedPassword};
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let svc = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
+        let admin: Password = "adminpw".into();
+        let user = svc.create_user("alice", &"userpw".into()).await.unwrap();
+        let enc = |pw: &str, key: HashedPassword| {
+            encrypt_password(&pw.into(), &key).unwrap().into_inner()
+        };
+        let sha = HashedPassword::from_password;
+        let raw = |k: &str| HashedPassword::from_hashed(k.to_string());
+        let hex40 = "0123456789abcdef0123456789abcdef01234567";
+        let rows = [
+            ("http://s1", enc("b1", sha("userpw"))), // user-hash key (normal login)
+            ("http://s2", enc("b2", sha("adminpw"))), // admin key (admin UI / SSO)
+            ("http://s3", enc("b3", raw("adminpw"))), // oldest: raw admin password
+            ("http://s4", "plain pass!".to_string()), // plaintext
+            ("http://s5", hex40.to_string()),        // plaintext that looks like base64
+            ("http://s6", enc("b6", raw("userpw"))), // oldest: raw user password
+        ];
+        for (url, value) in &rows {
+            sqlx::query("INSERT INTO server_mappings (user_id, server_url, mapped_username, mapped_password) VALUES (?, ?, 'u', ?)")
+                .bind(&user.id).bind(url).bind(value).execute(&pool).await.unwrap();
+        }
+        let s1 = svc
+            .get_server_mapping(&user.id, "http://s1")
+            .await
+            .unwrap()
+            .unwrap();
+        svc.store_authorization_session(
+            &user.id,
+            "http://s1",
+            &Authorization {
+                client: "c".into(),
+                device: "d".into(),
+                device_id: "id".into(),
+                version: "1".into(),
+                token: None,
+            },
+            "plaintoken".into(),
+            "orig".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE authorization_sessions SET jellyfin_token = 'plaintoken'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            svc.migrate_legacy_credentials(&admin).await.unwrap(),
+            (4, 2, 1)
+        );
+        assert_eq!(
+            svc.migrate_legacy_credentials(&admin).await.unwrap(),
+            (0, 2, 0)
+        );
+
+        let get = |url: &'static str| {
+            let svc = &svc;
+            let id = user.id.clone();
+            async move { svc.get_server_mapping(&id, url).await.unwrap().unwrap() }
+        };
+        for (url, want) in [
+            ("http://s1", "b1"),
+            ("http://s2", "b2"),
+            ("http://s3", "b3"),
+            ("http://s4", "plain pass!"),
+        ] {
+            let m = get(url).await;
+            assert_eq!(m.credential_format, "v2", "{url}");
+            assert_eq!(
+                svc.decrypt_server_mapping_password(&m, None, &admin)
+                    .unwrap()
+                    .as_str(),
+                want
+            );
+            // A wrong admin password doesn't matter for v2 rows.
+            assert_eq!(
+                svc.decrypt_server_mapping_password(&m, None, &"x".into())
+                    .unwrap()
+                    .as_str(),
+                want
+            );
+        }
+        // Ambiguous rows stay legacy; s6 opens once the user's password is known.
+        let (s5, s6) = (get("http://s5").await, get("http://s6").await);
+        assert_eq!(
+            (s5.credential_format.as_str(), s6.credential_format.as_str()),
+            ("legacy", "legacy")
+        );
+        assert_eq!(
+            svc.decrypt_server_mapping_password(&s5, None, &admin)
+                .unwrap()
+                .as_str(),
+            hex40
+        );
+        assert_eq!(
+            svc.decrypt_server_mapping_password(&s6, Some(&"userpw".into()), &admin)
+                .unwrap()
+                .as_str(),
+            "b6"
+        );
+        assert_eq!(
+            svc.upgrade_legacy_mappings_with_password(&user.id, &"userpw".into(), &admin)
+                .await
+                .unwrap(),
+            1
+        );
+        let s6 = get("http://s6").await;
+        assert_eq!(s6.credential_format, "v2");
+        assert_eq!(
+            svc.decrypt_server_mapping_password(&s6, None, &admin)
+                .unwrap()
+                .as_str(),
+            "b6"
+        );
+
+        // Token is encrypted at rest and decrypted on read.
+        let stored: String =
+            sqlx::query_scalar("SELECT jellyfin_token FROM authorization_sessions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(stored.starts_with("enc1:") && !stored.contains("plaintoken"));
+        sqlx::query("INSERT INTO servers (name, url, priority, created_at, updated_at) VALUES ('S1', 'http://s1', 1, ?, ?)")
+            .bind(chrono::Utc::now()).bind(chrono::Utc::now()).execute(&pool).await.unwrap();
+        let sessions = svc.get_user_sessions(&user.id, None).await.unwrap();
+        assert_eq!(sessions[0].0.jellyfin_token, "plaintoken");
+        assert_eq!(sessions[0].0.mapping_id, s1.id);
+
+        // A different session_key can't read v2 data: errors, never ciphertext.
+        let other = UserAuthorizationService::new(pool.clone(), &[9u8; 64]).unwrap();
+        assert!(other
+            .decrypt_server_mapping_password(&get("http://s1").await, None, &admin)
+            .is_err());
+        assert!(other
+            .get_user_sessions(&user.id, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn test_device_from_useragent_parsing() {
         // Test Switchfin format
@@ -1222,7 +1458,7 @@ mod tests {
     async fn test_get_or_create_user_uses_stable_username_identity() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         let first = service
             .get_or_create_user("testuser", &"password-1".into())
@@ -1255,7 +1491,7 @@ mod tests {
     async fn test_device_session_fallback_matching() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         // Create servers table
         sqlx::query(
@@ -1303,7 +1539,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -1463,7 +1698,7 @@ mod tests {
     async fn test_android_tv_device_id_rebind_after_login_transition() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         sqlx::query(
             r#"
@@ -1507,7 +1742,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -1563,7 +1797,7 @@ mod tests {
     async fn test_android_tv_rebind_collapses_multiple_stale_device_ids_for_same_user() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         sqlx::query(
             r#"
@@ -1607,7 +1841,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -1672,7 +1905,7 @@ mod tests {
     async fn test_android_tv_rebind_scope_does_not_touch_other_users() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         sqlx::query(
             r#"
@@ -1721,7 +1954,6 @@ mod tests {
                     "http://localhost:8096",
                     "mappeduser",
                     &"mappedpass".into(),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -1799,7 +2031,7 @@ mod tests {
     async fn test_android_tv_rebind_is_not_applied_to_other_clients() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         sqlx::query(
             r#"
@@ -1843,7 +2075,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -1906,7 +2137,7 @@ mod tests {
     async fn test_user_authorization_service() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         // Create the servers table (normally done by ServerStorageService)
         sqlx::query(
@@ -1954,7 +2185,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2000,7 +2230,7 @@ mod tests {
     async fn test_get_user_sessions_by_virtual_token() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         // Create the servers table (normally done by ServerStorageService)
         sqlx::query(
@@ -2048,7 +2278,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2100,7 +2329,7 @@ mod tests {
     async fn test_multiple_servers_with_priority() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         // Create the servers table
         sqlx::query(
@@ -2163,7 +2392,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser1",
                 &"mappedpass1".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2174,7 +2402,6 @@ mod tests {
                 "http://localhost:8097",
                 "mappeduser2",
                 &"mappedpass2".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2241,7 +2468,7 @@ mod tests {
     async fn test_cascade_delete_sessions_on_mapping_delete() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         // Create servers table
         sqlx::query(
@@ -2289,7 +2516,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2346,7 +2572,7 @@ mod tests {
     async fn test_delete_all_sessions_for_user() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         // Create servers table
         sqlx::query(
@@ -2392,7 +2618,7 @@ mod tests {
         // Add mappings for both servers
         for url in ["http://localhost:8096", "http://localhost:8097"] {
             service
-                .add_server_mapping(&user.id, url, "mappeduser", &"mappedpass".into(), None)
+                .add_server_mapping(&user.id, url, "mappeduser", &"mappedpass".into())
                 .await
                 .unwrap();
         }
@@ -2451,7 +2677,7 @@ mod tests {
     async fn test_add_server_mapping_upsert_preserves_mapping_id_and_sessions() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         // Create servers table
         sqlx::query(
@@ -2499,7 +2725,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2533,7 +2758,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser",
                 &"mappedpass-updated".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2591,7 +2815,7 @@ mod tests {
     async fn test_add_server_mapping_username_change_preserves_sessions_until_explicit_revoke() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let service = UserAuthorizationService::new(pool.clone());
+        let service = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
 
         sqlx::query(
             r#"
@@ -2635,7 +2859,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser-a",
                 &"mappedpass-a".into(),
-                None,
             )
             .await
             .unwrap();
@@ -2676,7 +2899,6 @@ mod tests {
                 "http://localhost:8096",
                 "mappeduser-b",
                 &"mappedpass-b".into(),
-                None,
             )
             .await
             .unwrap();

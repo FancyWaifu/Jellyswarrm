@@ -156,7 +156,6 @@ pub async fn connect_server(
                     server.url.as_str(),
                     &form.username,
                     &form.password,
-                    Some(&user.password_hash),
                 )
                 .await
             {

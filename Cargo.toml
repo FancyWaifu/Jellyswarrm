@@ -11,6 +11,7 @@ version = "0.2.1"
 
 [workspace.dependencies]
 aes-gcm = "0.10.3"
+argon2 = "0.5"
 anyhow = "1.0.100"
 
 # Rate limiting
@@ -62,6 +63,7 @@ serde_plain = "1.0.2"
 serde_urlencoded = "0.7.1"
 serde_with = "3.16.1"
 sha2 = "0.10.9"
+hkdf = "0.12.4"
 sha1 = "0.10.6"
 
 # Database

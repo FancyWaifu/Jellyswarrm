@@ -240,8 +240,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
         .init();
 
-    let loaded_config = crate::config::load_config();
-    info!("Loaded configuration: {:?}", loaded_config);
+    let loaded_config = crate::config::load_config().unwrap_or_else(|e| {
+        error!("Failed to load configuration: {:#}", e);
+        std::process::exit(1);
+    });
+    // Not the whole struct: it holds the master password and session_key.
+    info!(
+        "Loaded configuration from {:?}",
+        crate::config::DATA_DIR.join(crate::config::DEFAULT_CONFIG_FILENAME)
+    );
 
     // Resolve database path inside DATA_DIR
     let db_path = DATA_DIR.join("jellyswarrm.db");
@@ -303,7 +310,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
     // Initialize user authorization service
-    let user_authorization = UserAuthorizationService::new(pool.clone());
+    let user_authorization =
+        UserAuthorizationService::new(pool.clone(), &loaded_config.session_key).unwrap_or_else(
+            |e| {
+                error!("Invalid session_key: {}", e);
+                std::process::exit(1);
+            },
+        );
+    match user_authorization
+        .migrate_legacy_credentials(&loaded_config.password)
+        .await
+    {
+        Ok((upgraded, still_legacy, tokens)) => {
+            if upgraded + tokens > 0 {
+                info!("Encrypted {upgraded} legacy server mappings and {tokens} session tokens under the server key");
+            }
+            if still_legacy > 0 {
+                warn!("{still_legacy} legacy server mappings could not be verified yet; they upgrade on the user's next successful login");
+            }
+        }
+        Err(e) => {
+            error!("Failed to upgrade stored credentials: {}", e);
+            std::process::exit(1);
+        }
+    }
 
     // Initialize server storage service
     let server_storage = ServerStorageService::new(pool.clone());

@@ -1,5 +1,4 @@
 use crate::{
-    encryption::HashedPassword,
     models::{AuthenticateResponse, Authorization, SyncPlayUserAccessType},
     AppState,
 };
@@ -604,15 +603,10 @@ async fn authenticate_with_mapping_on_server(
     server_mapping: crate::user_authorization_service::ServerMapping,
 ) -> Result<AuthenticateResponse, QuickConnectAuthError> {
     let admin_password = state.get_admin_password().await;
-    let admin_password_hash: HashedPassword = (&admin_password).into();
-
-    let mapped_password = state.user_authorization.decrypt_server_mapping_password(
-        &server_mapping,
-        &user.original_password_hash,
-        &admin_password_hash,
-        None,
-        Some(&admin_password),
-    );
+    let mapped_password = state
+        .user_authorization
+        .decrypt_server_mapping_password(&server_mapping, None, &admin_password)
+        .map_err(|e| QuickConnectAuthError::Internal(e.to_string()))?;
 
     let client_info = ClientInfo {
         client: authorization.client.clone(),
@@ -643,7 +637,6 @@ async fn authenticate_with_mapping_on_server(
             server.url.as_str(),
             &server_mapping.mapped_username,
             &mapped_password,
-            Some(&user.original_password_hash),
         )
         .await
         .map_err(|e| QuickConnectAuthError::Internal(e.to_string()))?;
@@ -732,7 +725,9 @@ mod tests {
         MIGRATOR.run(&pool).await.unwrap();
 
         let data_context = DataContext {
-            user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
+            user_authorization: Arc::new(
+                UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap(),
+            ),
             server_storage: Arc::new(ServerStorageService::new(pool.clone())),
             oidc_storage: Arc::new(crate::oidc_storage::OidcStorageService::new(pool.clone())),
             media_storage: Arc::new(MediaStorageService::new(pool.clone())),
@@ -953,7 +948,6 @@ mod tests {
                 &upstream.uri(),
                 "mappeduser",
                 &"mappedpass".into(),
-                None,
             )
             .await
             .unwrap();

@@ -118,6 +118,97 @@ impl EncryptedPassword {
     }
 }
 
+/// A purpose-separated key derived (HKDF) from the persistent `session_key`.
+/// Unlike the legacy scheme it does not depend on any password, so stored
+/// backend credentials survive password-hash changes. Never stored anywhere.
+#[derive(Clone)]
+pub struct MappingEncryptionKey([u8; 32]);
+
+impl std::fmt::Debug for MappingEncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MappingEncryptionKey([redacted])")
+    }
+}
+
+/// Prefix marking an encrypted backend token; Jellyfin tokens are hex, so a
+/// stored value without it is a legacy plaintext token.
+const TOKEN_PREFIX: &str = "enc1:";
+
+impl MappingEncryptionKey {
+    pub fn for_server_mappings(session_key: &[u8]) -> Result<Self, EncryptionError> {
+        Self::derive(session_key, b"jellyswarrm/server-mapping/v1")
+    }
+
+    pub fn for_authorization_sessions(session_key: &[u8]) -> Result<Self, EncryptionError> {
+        Self::derive(session_key, b"jellyswarrm/authorization-session/v1")
+    }
+
+    fn derive(session_key: &[u8], purpose: &[u8]) -> Result<Self, EncryptionError> {
+        if session_key.len() < 32 {
+            return Err(EncryptionError::EncryptionFailed(
+                "session key is too short".into(),
+            ));
+        }
+        let mut key = [0u8; 32];
+        hkdf::Hkdf::<Sha256>::new(None, session_key)
+            .expand(purpose, &mut key)
+            .map_err(|_| EncryptionError::EncryptionFailed("key derivation failed".into()))?;
+        Ok(Self(key))
+    }
+
+    pub fn encrypt(&self, value: &Password) -> Result<EncryptedPassword, EncryptionError> {
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce);
+        let ciphertext = Aes256Gcm::new(&self.0.into())
+            .encrypt(Nonce::from_slice(&nonce), value.as_str().as_bytes())
+            .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
+        Ok(EncryptedPassword(
+            general_purpose::STANDARD.encode([&nonce[..], &ciphertext].concat()),
+        ))
+    }
+
+    pub fn decrypt(&self, value: &EncryptedPassword) -> Result<Password, EncryptionError> {
+        let data = general_purpose::STANDARD.decode(value.as_str())?;
+        if data.len() < 28 {
+            return Err(EncryptionError::InvalidNonceSize);
+        }
+        let (nonce, ciphertext) = data.split_at(12);
+        let plaintext = Aes256Gcm::new(&self.0.into())
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .map_err(|_| EncryptionError::PasswordDecryptionFailed)?;
+        String::from_utf8(plaintext)
+            .map(Password)
+            .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))
+    }
+
+    pub fn encrypt_token(&self, token: &str) -> Result<String, EncryptionError> {
+        Ok(format!("{TOKEN_PREFIX}{}", self.encrypt(&token.into())?.0))
+    }
+
+    /// Decrypt a stored token; a value without the prefix is legacy plaintext.
+    pub fn decrypt_token(&self, stored: &str) -> Result<String, EncryptionError> {
+        match stored.strip_prefix(TOKEN_PREFIX) {
+            Some(enc) => Ok(self
+                .decrypt(&EncryptedPassword(enc.to_string()))?
+                .into_inner()),
+            None => Ok(stored.to_string()),
+        }
+    }
+
+    pub fn is_encrypted_token(stored: &str) -> bool {
+        stored.starts_with(TOKEN_PREFIX)
+    }
+}
+
+/// True when a legacy mapping value cannot be an AES-GCM blob (not base64, or
+/// shorter than nonce + tag), i.e. it was stored as plaintext. `false` is
+/// ambiguous: a plaintext password can also be valid base64 of that length.
+pub fn is_legacy_plaintext(value: &EncryptedPassword) -> bool {
+    general_purpose::STANDARD
+        .decode(value.as_str())
+        .map_or(true, |bytes| bytes.len() < 28)
+}
+
 /// Custom error type for encryption/decryption operations
 #[derive(Debug, thiserror::Error)]
 pub enum EncryptionError {
@@ -300,5 +391,55 @@ mod tests {
         let decrypted = decrypt_password(&encrypted, &master_password).unwrap();
 
         assert_eq!(password, decrypted);
+    }
+
+    #[test]
+    fn mapping_key_round_trips_and_is_purpose_and_secret_bound() {
+        let key = MappingEncryptionKey::for_server_mappings(&[7u8; 64]).unwrap();
+        let ct = key.encrypt(&Password::from("backend-secret")).unwrap();
+        assert_eq!(key.decrypt(&ct).unwrap().as_str(), "backend-secret");
+        // Different secret, different purpose, and the legacy scheme all fail.
+        assert!(MappingEncryptionKey::for_server_mappings(&[8u8; 64])
+            .unwrap()
+            .decrypt(&ct)
+            .is_err());
+        assert!(MappingEncryptionKey::for_authorization_sessions(&[7u8; 64])
+            .unwrap()
+            .decrypt(&ct)
+            .is_err());
+        assert!(decrypt_password(&ct, &HashedPassword::from_password("x")).is_err());
+        assert!(MappingEncryptionKey::for_server_mappings(&[0u8; 31]).is_err());
+        // Random nonce: same plaintext, different ciphertext.
+        assert_ne!(ct, key.encrypt(&Password::from("backend-secret")).unwrap());
+    }
+
+    #[test]
+    fn tokens_are_prefixed_and_legacy_plaintext_passes_through() {
+        let key = MappingEncryptionKey::for_authorization_sessions(&[7u8; 64]).unwrap();
+        let stored = key
+            .encrypt_token("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        assert!(MappingEncryptionKey::is_encrypted_token(&stored));
+        assert!(!stored.contains("0123456789abcdef"));
+        assert_eq!(
+            key.decrypt_token(&stored).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(key.decrypt_token("legacyhex").unwrap(), "legacyhex");
+        let other = MappingEncryptionKey::for_authorization_sessions(&[9u8; 64]).unwrap();
+        assert!(other.decrypt_token(&stored).is_err());
+    }
+
+    #[test]
+    fn legacy_plaintext_detection() {
+        let raw = |s: &str| EncryptedPassword::from_raw(s.into());
+        assert!(is_legacy_plaintext(&raw("hunter2")));
+        assert!(is_legacy_plaintext(&raw("p@ss word!")));
+        let ct = encrypt_password(&"x".into(), &HashedPassword::from_password("k")).unwrap();
+        assert!(!is_legacy_plaintext(&ct));
+        // 40 hex chars is valid base64 of 30 bytes: ambiguous, not "plaintext".
+        assert!(!is_legacy_plaintext(&raw(
+            "0123456789abcdef0123456789abcdef01234567"
+        )));
     }
 }
