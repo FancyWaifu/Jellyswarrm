@@ -28,7 +28,8 @@ pub enum UserRole {
 pub struct User {
     pub id: String,
     pub username: String,
-    pub password_hash: HashedPassword,
+    /// Only the session auth hash: changes when the password does.
+    pub password_hash: String,
     pub role: UserRole,
 }
 
@@ -73,10 +74,10 @@ impl AuthUser for User {
     }
 
     fn session_auth_hash(&self) -> &[u8] {
-        self.password_hash.as_str().as_bytes() // We use the password hash as the auth
-                                               // hash--what this means
-                                               // is when the user changes their password the
-                                               // auth session becomes invalid.
+        self.password_hash.as_bytes() // We use the password hash as the auth
+                                      // hash--what this means
+                                      // is when the user changes their password the
+                                      // auth session becomes invalid.
     }
 }
 
@@ -127,7 +128,7 @@ impl AuthnBackend for Backend {
             let user = User {
                 id: "admin".to_string(),
                 username: creds.username,
-                password_hash: config.password.clone().into(),
+                password_hash: HashedPassword::from(config.password.clone()).into_inner(),
                 role: UserRole::Admin,
             };
             return Ok(Some(user));
@@ -142,7 +143,7 @@ impl AuthnBackend for Backend {
             let user = User {
                 id: user.id,
                 username: user.original_username,
-                password_hash: user.original_password_hash,
+                password_hash: user.original_password_hash.as_str().to_string(),
                 role: UserRole::User,
             };
             return Ok(Some(user));
@@ -158,7 +159,7 @@ impl AuthnBackend for Backend {
             return Ok(Some(User {
                 id: "admin".to_string(),
                 username: config.username.clone(),
-                password_hash: config.password.clone().into(),
+                password_hash: HashedPassword::from(config.password.clone()).into_inner(),
                 role: UserRole::Admin,
             }));
         }
@@ -167,7 +168,7 @@ impl AuthnBackend for Backend {
             let user = User {
                 id: user.id,
                 username: user.original_username,
-                password_hash: user.original_password_hash,
+                password_hash: user.original_password_hash.as_str().to_string(),
                 role: UserRole::User,
             };
             return Ok(Some(user));

@@ -156,13 +156,14 @@ pub async fn handle_authenticate_by_name(
 
     let mut auth_tasks = Vec::with_capacity(servers.len());
 
-    let existing_user = state
+    let mut existing_user = state
         .user_authorization
         .get_user_by_username(&payload.username)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if existing_user.is_none() && !state.auto_create_users_on_login().await {
+        crate::encryption::PasswordVerifier::dummy_verify(&payload.password).await;
         warn!(
             "Auto user creation disabled; rejecting login for non-existing local user '{}'",
             payload.username
@@ -173,11 +174,13 @@ pub async fn handle_authenticate_by_name(
     // An existing user must prove their local password before their stored
     // backend credentials are used. Admin- and SSO-created mappings decrypt
     // without it, so a backend accepting them proves nothing about the caller.
-    if let Some(user) = &existing_user {
-        if !user
-            .original_password_hash
-            .verify(payload.password.as_str())
-        {
+    if let Some(user) = &mut existing_user {
+        let ok = state
+            .user_authorization
+            .check_password(user, &payload.password)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !ok {
             warn!(
                 "Rejecting login for existing user '{}': wrong local password",
                 payload.username

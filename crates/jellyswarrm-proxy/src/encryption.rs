@@ -78,10 +78,7 @@ impl HashedPassword {
         Self(hash_password(password))
     }
 
-    pub fn verify(&self, password: &str) -> bool {
-        self.0 == hash_password(password)
-    }
-
+    #[cfg(test)]
     pub fn from_hashed(hashed: String) -> Self {
         Self(hashed)
     }
@@ -96,6 +93,92 @@ impl From<Password> for HashedPassword {
 impl From<&Password> for HashedPassword {
     fn from(password: &Password) -> Self {
         Self::from_password(password.as_str())
+    }
+}
+
+/// A stored local-password verifier: an Argon2id PHC string, or a legacy
+/// unsalted SHA-256 hex digest that is upgraded on the next successful login.
+/// Verification only; never used as key material.
+#[derive(Clone, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize)]
+#[sqlx(transparent)]
+pub struct PasswordVerifier(String);
+
+impl std::fmt::Debug for PasswordVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasswordVerifier([redacted])")
+    }
+}
+
+/// Verified against when the user doesn't exist, so a miss costs the same
+/// Argon2 work as a hit and response time doesn't reveal valid usernames.
+static DUMMY_VERIFIER: std::sync::LazyLock<PasswordVerifier> =
+    std::sync::LazyLock::new(|| PasswordVerifier::hash(&Password::from("dummy")));
+
+impl PasswordVerifier {
+    /// Argon2id with the crate defaults (19 MiB, t=2, p=1; OWASP minimum).
+    pub fn hash(password: &Password) -> Self {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let mut salt = [0u8; 16];
+        rand::rng().fill_bytes(&mut salt);
+        let salt = SaltString::encode_b64(&salt).expect("16-byte salt encodes");
+        Self(
+            argon2::Argon2::default()
+                .hash_password(password.as_str().as_bytes(), &salt)
+                .expect("argon2 with default params cannot fail")
+                .to_string(),
+        )
+    }
+
+    pub fn verify(&self, password: &str) -> bool {
+        use argon2::password_hash::{PasswordHash, PasswordVerifier as _};
+        if self.is_legacy() {
+            // Fixed-length digests compared without early exit.
+            let given = hash_password(password);
+            return given.len() == self.0.len()
+                && given
+                    .bytes()
+                    .zip(self.0.bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0;
+        }
+        PasswordHash::new(&self.0).is_ok_and(|h| {
+            argon2::Argon2::default()
+                .verify_password(password.as_bytes(), &h)
+                .is_ok()
+        })
+    }
+
+    /// True for a pre-Argon2 SHA-256 verifier.
+    pub fn is_legacy(&self) -> bool {
+        !self.0.starts_with("$argon2")
+    }
+
+    /// Argon2 is deliberately slow (~tens of ms): keep it off async workers.
+    pub async fn hash_async(password: &Password) -> Self {
+        let password = password.clone();
+        tokio::task::spawn_blocking(move || Self::hash(&password))
+            .await
+            .expect("argon2 hashing task panicked")
+    }
+
+    pub async fn verify_async(&self, password: &Password) -> bool {
+        let (this, password) = (self.clone(), password.clone());
+        tokio::task::spawn_blocking(move || this.verify(password.as_str()))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Burn the same work as a real check for a nonexistent user.
+    pub async fn dummy_verify(password: &Password) {
+        DUMMY_VERIFIER.verify_async(password).await;
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn from_raw(raw: String) -> Self {
+        Self(raw)
     }
 }
 
@@ -428,6 +511,37 @@ mod tests {
         assert_eq!(key.decrypt_token("legacyhex").unwrap(), "legacyhex");
         let other = MappingEncryptionKey::for_authorization_sessions(&[9u8; 64]).unwrap();
         assert!(other.decrypt_token(&stored).is_err());
+    }
+
+    #[test]
+    fn argon2_verifier_is_salted_argon2id_and_verifies() {
+        let a = PasswordVerifier::hash(&"correct horse".into());
+        let b = PasswordVerifier::hash(&"correct horse".into());
+        assert!(a.as_str().starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
+        assert_ne!(a, b, "random salt");
+        assert!(!a.is_legacy());
+        assert!(a.verify("correct horse") && b.verify("correct horse"));
+        assert!(!a.verify("correct horse ") && !a.verify(""));
+        let empty = PasswordVerifier::hash(&"".into());
+        assert!(empty.verify("") && !empty.verify(" "));
+        let unicode = PasswordVerifier::hash(&"pässwörd🔑".into());
+        assert!(unicode.verify("pässwörd🔑") && !unicode.verify("passwörd🔑"));
+    }
+
+    #[test]
+    fn legacy_and_garbage_verifiers() {
+        let legacy = PasswordVerifier::from_raw(hash_password("old"));
+        assert!(legacy.is_legacy());
+        assert!(legacy.verify("old") && !legacy.verify("Old"));
+        for junk in ["", "hash", "$argon2id$garbage", "0"] {
+            let v = PasswordVerifier::from_raw(junk.into());
+            assert!(
+                !v.verify("") && !v.verify("hash") && !v.verify("0"),
+                "{junk}"
+            );
+        }
+        // Debug never prints the hash.
+        assert!(!format!("{legacy:?}").contains(&hash_password("old")));
     }
 
     #[test]

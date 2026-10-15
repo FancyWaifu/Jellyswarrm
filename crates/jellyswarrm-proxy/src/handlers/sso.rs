@@ -306,10 +306,9 @@ pub async fn handle_sso_link(
     }
     let user = state
         .user_authorization
-        .get_user_by_username(username.trim())
+        .get_user_by_credentials(username.trim(), &password_str.as_str().into())
         .await
-        .map_err(internal)?
-        .filter(|u| u.original_password_hash.verify(&password_str));
+        .map_err(internal)?;
     let Some(user) = user else {
         pending.failed_attempts += 1;
         if pending.failed_attempts >= MAX_LINK_ATTEMPTS {

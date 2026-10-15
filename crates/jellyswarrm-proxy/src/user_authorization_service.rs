@@ -4,7 +4,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::MediaStreamingMode;
 use crate::encryption::{
     decrypt_password_with_key_material, is_legacy_plaintext, EncryptedPassword, EncryptionError,
-    HashedPassword, MappingEncryptionKey, Password,
+    HashedPassword, MappingEncryptionKey, Password, PasswordVerifier,
 };
 use crate::models::{generate_token, Authorization};
 use crate::server_storage::Server;
@@ -14,7 +14,7 @@ pub struct User {
     pub id: String,
     pub virtual_key: String,
     pub original_username: String,
-    pub original_password_hash: HashedPassword,
+    pub original_password_hash: PasswordVerifier,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -282,6 +282,45 @@ impl UserAuthorizationService {
         username.trim().to_string()
     }
 
+    /// Store a new verifier for `user` (and update the in-memory copy).
+    async fn set_verifier(
+        &self,
+        user: &mut User,
+        verifier: PasswordVerifier,
+    ) -> Result<(), sqlx::Error> {
+        let now = chrono::Utc::now();
+        sqlx::query("UPDATE users SET original_password_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(&verifier)
+            .bind(now)
+            .bind(&user.id)
+            .execute(&self.pool)
+            .await?;
+        user.original_password_hash = verifier;
+        user.updated_at = now;
+        Ok(())
+    }
+
+    /// Check `password` against `user`'s verifier; on success a legacy SHA-256
+    /// verifier is replaced with Argon2id.
+    pub async fn check_password(
+        &self,
+        user: &mut User,
+        password: &Password,
+    ) -> Result<bool, sqlx::Error> {
+        if !user.original_password_hash.verify_async(password).await {
+            return Ok(false);
+        }
+        if user.original_password_hash.is_legacy() {
+            self.set_verifier(user, PasswordVerifier::hash_async(password).await)
+                .await?;
+            info!(
+                "Upgraded password hash to Argon2id for user: {}",
+                user.original_username
+            );
+        }
+        Ok(true)
+    }
+
     /// Create or get a user by username.
     ///
     /// If the user already exists and the password changed, the stored password hash is updated.
@@ -290,27 +329,12 @@ impl UserAuthorizationService {
         username: &str,
         password: &Password,
     ) -> Result<User, sqlx::Error> {
-        let password_hash: HashedPassword = password.into();
         let username_key = Self::normalized_username_key(username);
 
         if let Some(mut user) = self.get_user_by_username(username).await? {
-            if user.original_password_hash != password_hash {
-                let now = chrono::Utc::now();
-                sqlx::query(
-                    r#"
-                    UPDATE users
-                    SET original_password_hash = ?, updated_at = ?
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(&password_hash)
-                .bind(now)
-                .bind(&user.id)
-                .execute(&self.pool)
-                .await?;
-
-                user.original_password_hash = password_hash;
-                user.updated_at = now;
+            if !self.check_password(&mut user, password).await? {
+                self.set_verifier(&mut user, PasswordVerifier::hash_async(password).await)
+                    .await?;
                 info!(
                     "Updated password hash for existing user: {}",
                     user.original_username
@@ -318,6 +342,7 @@ impl UserAuthorizationService {
             }
             return Ok(user);
         }
+        let password_hash = PasswordVerifier::hash_async(password).await;
 
         // Create new user
         let virtual_key = generate_token();
@@ -357,7 +382,7 @@ impl UserAuthorizationService {
         username: &str,
         password: &Password,
     ) -> Result<User, sqlx::Error> {
-        let password_hash: HashedPassword = password.into();
+        let password_hash = PasswordVerifier::hash_async(password).await;
         let username_key = Self::normalized_username_key(username);
         let virtual_key = generate_token();
         let user_id = generate_token();
@@ -445,21 +470,15 @@ impl UserAuthorizationService {
         username: &str,
         password: &Password,
     ) -> Result<Option<User>, sqlx::Error> {
-        let password_hash: HashedPassword = password.into();
-
-        let user = sqlx::query_as::<_, User>(
-            r#"
-            SELECT id, virtual_key, original_username, original_password_hash, created_at, updated_at
-            FROM users
-            WHERE lower(trim(original_username)) = lower(trim(?)) AND original_password_hash = ?
-            "#,
-        )
-        .bind(username)
-        .bind(&password_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(user)
+        // Salted hashes can't be matched in SQL: look up, then verify.
+        let Some(mut user) = self.get_user_by_username(username).await? else {
+            PasswordVerifier::dummy_verify(password).await;
+            return Ok(None);
+        };
+        Ok(self
+            .check_password(&mut user, password)
+            .await?
+            .then_some(user))
     }
 
     /// Add or update server mapping for a user (always stored under the server key).
@@ -1131,7 +1150,7 @@ impl UserAuthorizationService {
         self.upgrade_legacy_mappings_with_password(user_id, old_password, admin_password)
             .await?;
 
-        let password_hash: HashedPassword = new_password.into();
+        let password_hash = PasswordVerifier::hash_async(new_password).await;
         let res = sqlx::query(
             r#"
             UPDATE users
@@ -1154,12 +1173,9 @@ impl UserAuthorizationService {
         user_id: &str,
         password: &Password,
     ) -> Result<bool, sqlx::Error> {
-        let user = self.get_user_by_id(user_id).await?;
-
-        if let Some(user) = user {
-            Ok(user.original_password_hash.verify(password.as_str()))
-        } else {
-            Ok(false)
+        match self.get_user_by_id(user_id).await? {
+            Some(mut user) => self.check_password(&mut user, password).await,
+            None => Ok(false),
         }
     }
 
@@ -1258,6 +1274,95 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn legacy_sha_verifier_upgrades_to_argon2_on_successful_login_only() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let svc = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
+        let user = svc.create_user("carol", &"x".into()).await.unwrap();
+        sqlx::query("UPDATE users SET original_password_hash = ? WHERE id = ?")
+            .bind(crate::encryption::hash_password("oldpw"))
+            .bind(&user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stored = || async {
+            sqlx::query_scalar::<_, String>("SELECT original_password_hash FROM users")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        // Wrong password: rejected, verifier untouched; unknown user: None.
+        assert!(svc
+            .get_user_by_credentials("carol", &"nope".into())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(stored().await, crate::encryption::hash_password("oldpw"));
+        assert!(svc
+            .get_user_by_credentials("nobody", &"oldpw".into())
+            .await
+            .unwrap()
+            .is_none());
+
+        // Right password (case-insensitive username): accepted and upgraded.
+        let u = svc
+            .get_user_by_credentials(" CAROL ", &"oldpw".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let argon = stored().await;
+        assert!(argon.starts_with("$argon2id$"));
+        assert_eq!(u.original_password_hash.as_str(), argon);
+
+        // Later logins verify against Argon2 and do NOT rehash (a new salt would
+        // change the UI session auth hash and log the user out everywhere).
+        assert!(svc
+            .get_user_by_credentials("carol", &"oldpw".into())
+            .await
+            .unwrap()
+            .is_some());
+        svc.get_or_create_user("carol", &"oldpw".into())
+            .await
+            .unwrap();
+        assert!(svc
+            .verify_user_password(&u.id, &"oldpw".into())
+            .await
+            .unwrap());
+        assert_eq!(stored().await, argon);
+
+        // Password change: new works, old doesn't; server-key mappings unaffected.
+        svc.add_server_mapping(&u.id, "http://s", "m", &"backendpw".into())
+            .await
+            .unwrap();
+        assert!(svc
+            .update_user_password(&u.id, &"oldpw".into(), &"newpw".into(), &"admin".into())
+            .await
+            .unwrap());
+        assert!(svc
+            .get_user_by_credentials("carol", &"oldpw".into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(svc
+            .get_user_by_credentials("carol", &"newpw".into())
+            .await
+            .unwrap()
+            .is_some());
+        let m = svc
+            .get_server_mapping(&u.id, "http://s")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            svc.decrypt_server_mapping_password(&m, None, &"admin".into())
+                .unwrap()
+                .as_str(),
+            "backendpw"
+        );
+    }
+
     /// Every legacy shape the fork could have stored, upgraded at startup.
     #[tokio::test]
     async fn legacy_credentials_migrate_to_server_key() {
@@ -1267,6 +1372,12 @@ mod tests {
         let svc = UserAuthorizationService::new(pool.clone(), &[7u8; 64]).unwrap();
         let admin: Password = "adminpw".into();
         let user = svc.create_user("alice", &"userpw".into()).await.unwrap();
+        // Pre-Argon2 database: the verifier is the unsalted SHA-256 hex.
+        sqlx::query("UPDATE users SET original_password_hash = ?")
+            .bind(crate::encryption::hash_password("userpw"))
+            .execute(&pool)
+            .await
+            .unwrap();
         let enc = |pw: &str, key: HashedPassword| {
             encrypt_password(&pw.into(), &key).unwrap().into_inner()
         };
