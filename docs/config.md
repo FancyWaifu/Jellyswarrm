@@ -36,6 +36,7 @@ The table below lists all available configuration options:
 | `server_background_check_interval_secs` | `30` | `JELLYSWARRM_SERVER_BACKGROUND_CHECK_INTERVAL_SECS` | Interval in seconds for background server health checks. |
 | `auto_create_users_on_login` | `true` | `JELLYSWARRM_AUTO_CREATE_USERS_ON_LOGIN` | Automatically create local users on successful upstream login. |
 | `trusted_proxies` | `[]` | — (set in the TOML file) | IPs of reverse proxies whose `X-Forwarded-For` is trusted for per-IP login rate limiting, e.g. `["172.18.0.2"]`. Leave empty when clients connect directly; behind an unlisted proxy all clients share one rate-limit bucket. |
+| `trust_cf_connecting_ip` | `false` | — (set in the TOML file) | Also trust Cloudflare's `CF-Connecting-IP` from a `trusted_proxies` peer (e.g. a cloudflared tunnel). Enable only if all traffic to that proxy comes through Cloudflare, otherwise clients can forge it. |
 
 ---
 

@@ -372,6 +372,12 @@ pub struct AppConfig {
     /// peer, so everyone behind an unlisted proxy shares one bucket.
     #[serde(default)]
     pub trusted_proxies: Vec<std::net::IpAddr>,
+
+    /// Also believe Cloudflare's `CF-Connecting-IP` from a trusted proxy. Only
+    /// enable when every request reaches that proxy through Cloudflare (e.g. a
+    /// cloudflared tunnel); otherwise clients can forge it.
+    #[serde(default)]
+    pub trust_cf_connecting_ip: bool,
 }
 
 fn default_watched_sync_retry_interval_secs() -> u64 {

@@ -76,11 +76,13 @@ impl AuthRateLimiter {
 /// The IP to rate-limit on. The TCP peer is authoritative. Forwarding headers
 /// are only believed when the peer is a configured `trusted_proxies` entry, and
 /// then only the *rightmost* hop — the one that proxy appended. Everything left
-/// of it is client-controlled and trivially spoofed.
+/// of it is client-controlled and trivially spoofed. With `trust_cf` the
+/// Cloudflare-set `CF-Connecting-IP` wins (Cloudflare overwrites any client copy).
 pub fn client_ip(
     peer: SocketAddr,
     headers: &axum::http::HeaderMap,
     trusted_proxies: &[IpAddr],
+    trust_cf: bool,
 ) -> IpAddr {
     let peer_ip = peer.ip().to_canonical();
     if !trusted_proxies.contains(&peer_ip) {
@@ -93,7 +95,10 @@ pub fn client_ip(
             .and_then(|v| v.rsplit(',').next())
             .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
     };
-    header_ip("x-forwarded-for")
+    trust_cf
+        .then(|| header_ip("cf-connecting-ip"))
+        .flatten()
+        .or_else(|| header_ip("x-forwarded-for"))
         .or_else(|| header_ip("x-real-ip"))
         .unwrap_or(peer_ip)
 }
@@ -141,16 +146,33 @@ mod tests {
         h.insert("x-forwarded-for", "1.2.3.4, 9.9.9.9".parse().unwrap());
         let proxy: SocketAddr = "172.18.0.2:5000".parse().unwrap();
         // Untrusted peer (even a private one): headers are ignored entirely.
-        assert_eq!(client_ip(proxy, &h, &[]), proxy.ip());
+        assert_eq!(client_ip(proxy, &h, &[], false), proxy.ip());
         // Trusted proxy: only the rightmost (proxy-appended) hop counts.
         assert_eq!(
-            client_ip(proxy, &h, &[proxy.ip()]),
+            client_ip(proxy, &h, &[proxy.ip()], false),
             "9.9.9.9".parse::<IpAddr>().unwrap()
         );
         // Trusted proxy, no headers: the peer itself.
         assert_eq!(
-            client_ip(proxy, &Default::default(), &[proxy.ip()]),
+            client_ip(proxy, &Default::default(), &[proxy.ip()], false),
             proxy.ip()
         );
+    }
+
+    #[test]
+    fn cf_connecting_ip_only_when_enabled_and_peer_trusted() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("cf-connecting-ip", "5.6.7.8".parse().unwrap());
+        h.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        let tunnel: SocketAddr = "172.18.0.9:4000".parse().unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(client_ip(tunnel, &h, &[tunnel.ip()], true), ip("5.6.7.8"));
+        // Off by default: falls back to X-Forwarded-For.
+        assert_eq!(client_ip(tunnel, &h, &[tunnel.ip()], false), ip("9.9.9.9"));
+        // Never from an untrusted peer, even when enabled.
+        assert_eq!(client_ip(tunnel, &h, &[], true), tunnel.ip());
+        // Enabled but header missing: X-Forwarded-For as before.
+        h.remove("cf-connecting-ip");
+        assert_eq!(client_ip(tunnel, &h, &[tunnel.ip()], true), ip("9.9.9.9"));
     }
 }

@@ -105,9 +105,12 @@ impl AppState {
         peer: std::net::SocketAddr,
         headers: &http::HeaderMap,
     ) -> bool {
-        let trusted = self.config.read().await.trusted_proxies.clone();
+        let (trusted, cf) = {
+            let c = self.config.read().await;
+            (c.trusted_proxies.clone(), c.trust_cf_connecting_ip)
+        };
         self.auth_rate_limiter
-            .check(rate_limiter::client_ip(peer, headers, &trusted))
+            .check(rate_limiter::client_ip(peer, headers, &trusted, cf))
             .await
     }
 
