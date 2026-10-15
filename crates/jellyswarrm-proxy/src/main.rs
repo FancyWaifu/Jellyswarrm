@@ -739,6 +739,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "/Latest",
                         get(handlers::federated::get_items_from_all_servers_if_not_restricted),
                     )
+                    // Before `/{item_id}`, which would take "Filters" for an item id
+                    // (-> 502). A merged library's id is its canonical member's
+                    // virtual id, so the plain proxy routes it to that backend.
+                    // ponytail: filters come from that one backend; a union across
+                    // members needs per-backend genre ids remapped.
+                    .route("/Filters", get(proxy_handler))
+                    .route("/Filters2", get(proxy_handler))
                     .route("/{item_id}", get(handlers::items::get_item))
                     .route("/{item_id}/Similar", get(handlers::items::get_items))
                     .route("/{item_id}/LocalTrailers", get(handlers::items::get_items))
