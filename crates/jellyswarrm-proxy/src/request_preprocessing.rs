@@ -59,7 +59,7 @@ pub async fn resolve_request_identity_from_headers_uri(
             });
         }
     }
-    let user = get_user_from_request(&request, &auth, state).await?;
+    let user = get_user_from_request(&auth, state).await?;
 
     Ok(RequestIdentity { auth, user, device })
 }
@@ -241,7 +241,7 @@ pub async fn extract_request_infos(
         None
     };
 
-    let mut user = get_user_from_request(&request, &auth, state).await?;
+    let user = get_user_from_request(&auth, state).await?;
 
     // look into the body for information
     let request_body_result = if let Some(json) = body_to_json(&request) {
@@ -254,12 +254,6 @@ pub async fn extract_request_infos(
             accumulator,
         )
         .await?;
-        if let Some(found_user) = analysis_result.get_user() {
-            debug!("Found user in request body: {:?}", found_user);
-            if user.is_none() {
-                user = Some(found_user);
-            }
-        }
 
         if let Some(found_server) = analysis_result.get_server() {
             debug!("Found server in request body: {}", &found_server.name);
@@ -685,36 +679,12 @@ pub async fn resolve_server(
 }
 
 pub async fn get_user_from_request(
-    request: &reqwest::Request,
     auth: &Option<JellyfinAuthorization>,
     state: &AppState,
 ) -> Result<Option<User>> {
+    // A user is only ever resolved from a credential. Never trust a bare
+    // userId from the path/query/body: anyone could name any user.
     let Some(auth) = auth else {
-        // No auth, check for user ID in path
-        for &path_segment in USER_ID_PATH_TAGS {
-            if let Some(user_id) = contains_id(request.url(), path_segment) {
-                debug!("Found {} ID in request: {}", path_segment, user_id);
-                let user = state.user_authorization.get_user_by_id(&user_id).await?;
-                return Ok(user);
-            }
-        }
-
-        // If that fails, check query parameters
-        for &param_name in USER_ID_QUERY_TAGS {
-            if let Some(param_value) = request
-                .url()
-                .query_pairs()
-                .find(|(k, _)| k.eq_ignore_ascii_case(param_name))
-                .map(|(_, v)| v.to_string())
-            {
-                debug!("Found {} in query: {}", param_name, param_value);
-                let user = state
-                    .user_authorization
-                    .get_user_by_id(&param_value)
-                    .await?;
-                return Ok(user);
-            }
-        }
         return Ok(None);
     };
 

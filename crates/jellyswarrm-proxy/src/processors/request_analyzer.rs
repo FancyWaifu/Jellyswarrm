@@ -8,7 +8,6 @@ use crate::{
         json_processor::{JsonAnalyzer, JsonProcessingContext},
     },
     server_storage::Server,
-    user_authorization_service::User,
     DataContext,
 };
 
@@ -28,7 +27,6 @@ pub struct RequestBodyAnalysisResult {
     pub found_session_ids: Vec<String>,
     pub found_user_ids: Vec<String>,
     pub servers: Vec<Server>,
-    pub users: Vec<User>,
 }
 
 impl RequestBodyAnalysisResult {
@@ -46,22 +44,6 @@ impl RequestBodyAnalysisResult {
             .max_by_key(|&(_, count)| count)
             .unwrap();
         Some(most_common_server.clone())
-    }
-
-    /// Returns the user with the highest occurance in the users vector, or None if the vector is empty.
-    pub fn get_user(&self) -> Option<User> {
-        if self.users.is_empty() {
-            return None;
-        }
-        let mut user_count = std::collections::HashMap::new();
-        for user in &self.users {
-            *user_count.entry(user).or_insert(0) += 1;
-        }
-        let (most_common_user, _) = user_count
-            .into_iter()
-            .max_by_key(|&(_, count)| count)
-            .unwrap();
-        Some(most_common_user.clone())
     }
 }
 
@@ -109,14 +91,6 @@ impl JsonAnalyzer<RequestAnalysisContext, RequestBodyAnalysisResult> for Request
         // Check if this is a UserId field (case-insensitive)
         if USER_FIELDS.contains(&json_context.key) {
             if let serde_json::Value::String(ref user_id) = value {
-                if let Some(user) = self
-                    .data_context
-                    .user_authorization
-                    .get_user_by_id(user_id)
-                    .await?
-                {
-                    accumulator.users.push(user);
-                }
                 accumulator.found_user_ids.push(user_id.clone());
             }
         }
