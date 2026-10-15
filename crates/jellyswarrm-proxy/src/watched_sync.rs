@@ -64,13 +64,23 @@ const BACKWARD_TOLERANCE_TICKS: i64 = 100_000_000;
 /// resume point backward on every other server. A forward report syncs when it
 /// advanced ≥ the threshold (or on `final_stop`), so running playback propagates
 /// promptly while a paused/idle client re-reporting the same spot doesn't spam.
+///
+/// A playback *start* re-baselines the marker without syncing: starting over
+/// (a rewatch, or seeking back on purpose) is the user's choice, and ghost
+/// sessions only ever send progress, never a start. Progress from the new
+/// baseline then syncs as usual.
 pub async fn should_sync_position(
     user_id: &str,
     item_id: &str,
     position_ticks: i64,
+    started: bool,
     final_stop: bool,
 ) -> bool {
     let key = (user_id.to_string(), item_id.to_string());
+    if started {
+        LAST_SYNC_POS.insert(key, position_ticks).await;
+        return false;
+    }
     let furthest = LAST_SYNC_POS.get(&key).await.unwrap_or(0);
     // Going backward (beyond jitter) → stale/ghost report; never regress.
     if position_ticks + BACKWARD_TOLERANCE_TICKS < furthest {
@@ -534,19 +544,23 @@ mod tests {
         let u = "throttle-test-user";
         let i = "item-A";
         // First report always syncs (no prior).
-        assert!(should_sync_position(u, i, 1_000_000_000, false).await);
+        assert!(should_sync_position(u, i, 1_000_000_000, false, false).await);
         // A tiny move (< 30s) is throttled.
-        assert!(!should_sync_position(u, i, 1_000_000_001, false).await);
+        assert!(!should_sync_position(u, i, 1_000_000_001, false, false).await);
         // Same position re-reported (paused client) — throttled, no spam.
-        assert!(!should_sync_position(u, i, 1_000_000_001, false).await);
+        assert!(!should_sync_position(u, i, 1_000_000_001, false, false).await);
         // A move past the threshold syncs.
-        assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_000, false).await);
+        assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_000, false, false).await);
         // A stop syncs even if the position barely changed (still forward).
-        assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_001, true).await);
+        assert!(should_sync_position(u, i, 1_000_000_000 + 400_000_001, false, true).await);
         // A report far BEHIND the furthest (stale/ghost client) is ignored, even
         // on stop — resume must not regress.
-        assert!(!should_sync_position(u, i, 12_000_000, false).await);
-        assert!(!should_sync_position(u, i, 12_000_000, true).await);
+        assert!(!should_sync_position(u, i, 12_000_000, false, false).await);
+        assert!(!should_sync_position(u, i, 12_000_000, false, true).await);
+        // A deliberate restart (rewatch) re-baselines; progress from there syncs.
+        assert!(!should_sync_position(u, i, 0, true, false).await);
+        assert!(should_sync_position(u, i, 400_000_000, false, false).await);
+        assert!(should_sync_position(u, i, 450_000_000, false, true).await);
     }
 
     #[test]

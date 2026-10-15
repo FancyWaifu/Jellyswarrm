@@ -993,6 +993,7 @@ async fn proxy_handler(
         .path()
         .trim_end_matches('/')
         .ends_with("/Stopped");
+    let playing_is_start = request_url.path().trim_end_matches('/') == "/Sessions/Playing";
     // For playback reports we capture the *virtual* ItemId + position from the body
     // (below) and resolve its owning backend ourselves — the request may be routed
     // to a different backend (a version-picker source), so we can't trust the
@@ -1068,6 +1069,7 @@ async fn proxy_handler(
                     &user_id,
                     &virtual_item,
                     playing_position_ticks,
+                    playing_is_start,
                     playing_is_stopped,
                 )
                 .await
