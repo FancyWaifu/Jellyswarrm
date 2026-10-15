@@ -5,8 +5,10 @@
 //! glue between that, the session store, and the federation layer. See
 //! `docs/sso.md`.
 
+use std::net::SocketAddr;
+
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Form, Json,
@@ -215,6 +217,7 @@ pub async fn handle_sso_callback(
         issuer: claims.issuer.clone(),
         subject: claims.subject.clone(),
         email: claims.email.clone(),
+        failed_attempts: 0,
     };
     session
         .insert(PENDING_KEY, &pending)
@@ -230,8 +233,15 @@ struct PendingLink {
     issuer: String,
     subject: String,
     email: Option<String>,
+    #[serde(default)]
+    failed_attempts: u32,
 }
 const PENDING_KEY: &str = "oidc_pending";
+
+/// Wrong-password tries allowed per SSO login before the user has to go back
+/// through the IdP. Together with the per-IP limiter this stops one validated
+/// SSO login from being used as an unlimited password oracle.
+const MAX_LINK_ATTEMPTS: u32 = 3;
 
 #[derive(Deserialize)]
 pub struct LinkForm {
@@ -245,10 +255,18 @@ pub struct LinkForm {
 /// or creating a new one (auto-provision).
 pub async fn handle_sso_link(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     session: Session,
     Form(form): Form<LinkForm>,
 ) -> Result<Response, HandlerError> {
-    let pending: PendingLink = session.get(PENDING_KEY).await.map_err(internal)?.ok_or((
+    if !state.auth_rate_ok(peer, &headers).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many attempts — wait a moment".to_string(),
+        ));
+    }
+    let mut pending: PendingLink = session.get(PENDING_KEY).await.map_err(internal)?.ok_or((
         StatusCode::BAD_REQUEST,
         "no SSO login in progress (session expired?) — start again".to_string(),
     ))?;
@@ -291,16 +309,25 @@ pub async fn handle_sso_link(
         .get_user_by_username(username.trim())
         .await
         .map_err(internal)?
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "invalid username or password".to_string(),
-        ))?;
-    if !user.original_password_hash.verify(&password_str) {
+        .filter(|u| u.original_password_hash.verify(&password_str));
+    let Some(user) = user else {
+        pending.failed_attempts += 1;
+        if pending.failed_attempts >= MAX_LINK_ATTEMPTS {
+            let _ = session.remove::<PendingLink>(PENDING_KEY).await;
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "too many failed attempts — sign in with SSO again".to_string(),
+            ));
+        }
+        session
+            .insert(PENDING_KEY, &pending)
+            .await
+            .map_err(internal)?;
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid username or password".to_string(),
         ));
-    }
+    };
 
     // Re-key the user's backend mappings: decrypt with their password, re-encrypt
     // under the master key so password-less SSO logins can use them.
