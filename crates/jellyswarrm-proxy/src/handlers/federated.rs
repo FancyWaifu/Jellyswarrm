@@ -459,8 +459,24 @@ fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
             .unwrap_or_default()
     };
     match item.item_type {
-        Movie => movie_dedup_key(item).or_else(|| title().map(|n| format!("mv#{n}"))),
-        Episode => episode_dedup_key(item).or_else(|| title().map(|n| format!("ep#{n}"))),
+        // Title fallbacks carry a disambiguator so same-named but different
+        // titles ("Halloween" 1978 vs 2018, every show's "Pilot") stay apart.
+        Movie => movie_dedup_key(item).or_else(|| {
+            let year = item
+                .extra
+                .get("ProductionYear")
+                .and_then(|v| v.as_i64())
+                .map(|y| y.to_string())
+                .unwrap_or_default();
+            title().map(|n| format!("mv#{n}|{year}"))
+        }),
+        Episode => episode_dedup_key(item).or_else(|| {
+            let series = strip_server_suffix(item.series_name.as_deref()?)
+                .trim()
+                .to_lowercase();
+            (!series.is_empty()).then_some(())?;
+            title().map(|n| format!("ep#{series}|{n}"))
+        }),
         // All remaining LEAF content types (music, books, home videos, photos,
         // recordings…). Cross-server copies weren't deduped (only movies &
         // episodes were), so they doubled up in "Recently Added" etc. Match by
@@ -491,14 +507,17 @@ fn leaf_dedup_key(item: &crate::models::MediaItem) -> Option<String> {
             let album = extra_lc("Album");
             // Track/disc number keeps two distinct same-titled tracks apart while
             // still collapsing the SAME track across backends (same number).
-            let track = item
-                .extra
-                .get("IndexNumber")
-                .and_then(|v| v.as_i64())
-                .map(|n| n.to_string())
-                .unwrap_or_default();
+            let num = |k: &str| {
+                item.extra
+                    .get(k)
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n.to_string())
+                    .unwrap_or_default()
+            };
+            // Disc + track: "Intro" on disc 1 and disc 2 are different tracks.
+            let (disc, track) = (num("ParentIndexNumber"), num("IndexNumber"));
             Some(format!(
-                "{:?}#{artist}|{album}|{track}|{title}",
+                "{:?}#{artist}|{album}|{disc}|{track}|{title}",
                 item.item_type
             ))
         }
