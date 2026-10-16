@@ -44,10 +44,21 @@ mod post {
 
     pub async fn login(
         State(state): axum::extract::State<AppState>,
+        axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+        headers: axum::http::HeaderMap,
         mut auth_session: AuthSession,
         messages: Messages,
         Form(creds): Form<Credentials>,
     ) -> impl IntoResponse {
+        // Same per-client budget as the API login: this form checks the master
+        // password and every user's password.
+        if !state.auth_rate_ok(peer, &headers).await {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many login attempts. Wait a minute and try again.",
+            )
+                .into_response();
+        }
         let user = match auth_session.authenticate(creds.clone()).await {
             Ok(Some(user)) => user,
             Ok(None) => {
