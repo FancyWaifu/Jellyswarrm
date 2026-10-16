@@ -1,0 +1,99 @@
+# Jellyswarrm end-to-end stack. See README.md.
+# Fully isolated: `internal: true` gives the network no route off the Docker host.
+# Images are never pulled unless PULL_POLICY=missing (CI sets it).
+networks:
+  e2e:
+    internal: true
+services:
+  jf-a:
+    image: jellyfin/jellyfin:${JF_A:-12.2}
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    volumes: ["${MEDIA:-./media}/a:/media:ro"]
+    tmpfs: ["/config", "/cache"]
+  jf-b:
+    image: jellyfin/jellyfin:${JF_B:-10.11.9}
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    volumes: ["${MEDIA:-./media}/b:/media:ro"]
+    tmpfs: ["/config", "/cache"]
+  proxy:
+    image: ${PROXY_BASE_IMAGE:-debian:bookworm-slim}
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    entrypoint: ["/bin/proxy"]
+    environment: {JELLYSWARRM_DATA_DIR: /app/data, RUST_LOG: "${RUST_LOG:-info}", SSL_CERT_FILE: "${PROXY_CA:-/ca/ca.pem}"}
+    volumes: ["./bin/${BIN}:/bin/proxy:ro", "./data-${DATA:-${BIN}}:/app/data", "./idp/authelia/ca.pem:/ca/ca.pem:ro"]
+  runner:
+    image: ${RUNNER_IMAGE:-python:3.12-slim}
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    entrypoint: ["sleep", "infinity"]
+    environment: {SSL_CERT_FILE: /ca/ca.pem}
+    volumes: ["./tests:/tests:ro", "./state:/state", "./idp/authelia/ca.pem:/ca/ca.pem:ro"]
+
+  # --- identity providers (same isolated network) ---
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    command: ["start-dev", "--import-realm"]
+    environment: {KC_BOOTSTRAP_ADMIN_USERNAME: admin, KC_BOOTSTRAP_ADMIN_PASSWORD: admin}
+    volumes: ["./idp/keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro"]
+  dex:
+    image: ghcr.io/dexidp/dex:v2.43.1
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes: ["./idp/dex/config.yaml:/etc/dex/config.yaml:ro"]
+  ak-db:
+    image: postgres:16-alpine
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    environment: {POSTGRES_USER: authentik, POSTGRES_PASSWORD: akdbpw, POSTGRES_DB: authentik}
+    tmpfs: ["/var/lib/postgresql/data"]
+  ak-redis:
+    image: redis:7-alpine
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+  authentik:
+    image: ghcr.io/goauthentik/server:2025.8
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    command: server
+    environment: &akenv
+      AUTHENTIK_SECRET_KEY: e2e-authentik-secret-key-0123456789abcdef0123456789
+      AUTHENTIK_REDIS__HOST: ak-redis
+      AUTHENTIK_POSTGRESQL__HOST: ak-db
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: akdbpw
+      AUTHENTIK_BOOTSTRAP_PASSWORD: akadminpw
+      AUTHENTIK_BOOTSTRAP_TOKEN: e2e-ak-bootstrap-token
+      AUTHENTIK_BOOTSTRAP_EMAIL: admin@ak.test
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_AVATARS: none
+  ak-worker:
+    image: ghcr.io/goauthentik/server:2025.8
+    pull_policy: ${PULL_POLICY:-never}
+    networks: [e2e]
+    command: worker
+    environment: *akenv
+  authelia:
+    image: authelia/authelia:4.39
+    pull_policy: ${PULL_POLICY:-never}
+    networks:
+      e2e:
+        aliases: [auth.jsw.test]
+    volumes: ["./idp/authelia:/config:ro"]
+  browser:
+    image: jsw-playwright:1.52
+    # Built locally (`docker compose build browser`), never pulled.
+    build: {context: ., dockerfile: Dockerfile.playwright}
+    pull_policy: never
+    networks: [e2e]
+    entrypoint: ["sleep", "infinity"]
+    shm_size: 1gb
+    volumes: ["./tests:/tests:ro", "./state:/state"]

@@ -1,0 +1,19 @@
+{
+  "realm": "jsw",
+  "enabled": true,
+  "sslRequired": "none",
+  "clients": [{
+    "clientId": "jellyswarrm", "enabled": true, "publicClient": false,
+    "secret": "kc-secret", "protocol": "openid-connect",
+    "redirectUris": ["http://proxy:3000/sso/callback"],
+    "standardFlowEnabled": true, "directAccessGrantsEnabled": false
+  }],
+  "users": [
+    {"username": "kclinker", "enabled": true, "email": "linker@kc.test", "emailVerified": true,
+     "firstName": "Kc", "lastName": "Linker", "credentials": [{"type": "password", "value": "kcpass", "temporary": false}]},
+    {"username": "kclegacy", "enabled": true, "email": "legacy@kc.test", "emailVerified": true,
+     "firstName": "Kc", "lastName": "Legacy", "credentials": [{"type": "password", "value": "kcpass", "temporary": false}]},
+    {"username": "kcnew", "enabled": true, "email": "new@kc.test", "emailVerified": true,
+     "firstName": "Kc", "lastName": "New", "credentials": [{"type": "password", "value": "kcpass", "temporary": false}]}
+  ]
+}

@@ -1,0 +1,3 @@
+users:
+  autlinker: {displayname: Aut Linker, password: '$2b$10$DUuQoXdmIpMHiJdk0aIsa.lwv8q/DQWu4kZ8DQboDN6qtmb54h11C', email: linker@aut.test}
+  autnew: {displayname: Aut New, password: '$2b$10$DUuQoXdmIpMHiJdk0aIsa.lwv8q/DQWu4kZ8DQboDN6qtmb54h11C', email: new@aut.test}

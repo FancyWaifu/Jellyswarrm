@@ -1,0 +1,3 @@
+# Headless Chromium + the Playwright Python package, for the browser suites.
+FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
+RUN pip install --break-system-packages playwright==1.52.0

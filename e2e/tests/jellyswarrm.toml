@@ -1,0 +1,50 @@
+username = "admin"
+password = "masterpw"
+host = "0.0.0.0"
+port = 3000
+dedup_movies = true
+watched_sync_retry_interval_secs = 5
+oidc_auto_provision = true
+
+[[preconfigured_servers]]
+url = "http://jf-a:8096"
+name = "A"
+priority = 100
+admin_username = "admin"
+admin_password = "password"
+
+[[preconfigured_servers]]
+url = "http://jf-b:8096"
+name = "B"
+priority = 90
+admin_username = "admin"
+admin_password = "password"
+
+
+[[preconfigured_oidc_providers]]
+slug = "kc"
+display_name = "Keycloak"
+issuer_url = "http://keycloak:8080/realms/jsw"
+client_id = "jellyswarrm"
+client_secret = "kc-secret"
+
+[[preconfigured_oidc_providers]]
+slug = "dex"
+display_name = "Dex"
+issuer_url = "http://dex:5556/dex"
+client_id = "jellyswarrm"
+client_secret = "dex-secret"
+
+[[preconfigured_oidc_providers]]
+slug = "ak"
+display_name = "Authentik"
+issuer_url = "http://authentik:9000/application/o/jellyswarrm/"
+client_id = "jellyswarrm"
+client_secret = "ak-secret"
+
+[[preconfigured_oidc_providers]]
+slug = "aut"
+display_name = "Authelia"
+issuer_url = "https://auth.jsw.test:9091"
+client_id = "jellyswarrm"
+client_secret = "aut-secret"

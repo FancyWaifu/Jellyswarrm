@@ -1,0 +1,74 @@
+name: E2E
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    # 22.04's glibc is older than debian:bookworm's, so the binary runs in the proxy container.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [quick, browser, sso]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.92.0
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: npm
+        cache-dependency-path: ui/package-lock.json
+
+    - name: Install UI deps
+      working-directory: ui
+      run: npm ci
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          e2e/.target
+        key: ${{ runner.os }}-e2e-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/*.rs') }}
+        restore-keys: |
+          ${{ runner.os }}-e2e-${{ hashFiles('**/Cargo.lock') }}-
+          ${{ runner.os }}-e2e-
+
+    - name: Build proxy (this commit and the pre-upgrade baseline)
+      working-directory: e2e
+      run: |
+        ./build.sh WORKTREE new
+        ./build.sh 7092b79 old
+
+    - name: Build the browser image
+      if: matrix.group == 'browser'
+      working-directory: e2e
+      run: docker compose -p jsw-e2e build browser
+
+    - name: Run ${{ matrix.group }} suites
+      working-directory: e2e
+      env:
+        PULL_POLICY: missing
+      run: ./run-all.sh ${{ matrix.group }}
+
+    - name: Upload logs and screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-${{ matrix.group }}
+        path: e2e/state/
+        if-no-files-found: ignore

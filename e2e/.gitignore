@@ -1,0 +1,12 @@
+bin/
+data-*/
+state/
+media/
+media-big/
+.target/
+.wt-*/
+idp/authelia/configuration.yml
+idp/authelia/*.pem
+idp/authelia/*.key
+idp/authelia/*.csr
+idp/authelia/*.srl

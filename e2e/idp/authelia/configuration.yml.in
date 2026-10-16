@@ -1,0 +1,26 @@
+server:
+  address: 'tcp://0.0.0.0:9091/'
+  tls: {key: /config/tls.key, certificate: /config/tls.pem}
+log: {level: info}
+identity_validation: {reset_password: {jwt_secret: 'a-very-long-reset-password-jwt-secret-0123456789'}}
+authentication_backend: {file: {path: /config/users.yml}}
+access_control: {default_policy: one_factor}
+session:
+  secret: 'a-very-long-session-secret-0123456789abcdef'
+  cookies: [{domain: 'jsw.test', authelia_url: 'https://auth.jsw.test:9091'}]
+storage: {encryption_key: 'a-very-long-storage-encryption-key-0123456789', local: {path: /tmp/db.sqlite3}}
+notifier: {filesystem: {filename: /tmp/notification.txt}}
+identity_providers:
+  oidc:
+    hmac_secret: 'a-very-long-oidc-hmac-secret-0123456789abcdef'
+    jwks:
+      - key: |
+__OIDC_KEY__
+    clients:
+      - client_id: jellyswarrm
+        client_secret: '$plaintext$aut-secret'
+        redirect_uris: ['http://proxy:3000/sso/callback']
+        scopes: [openid, profile, email]
+        authorization_policy: one_factor
+        consent_mode: implicit
+        token_endpoint_auth_method: client_secret_basic
