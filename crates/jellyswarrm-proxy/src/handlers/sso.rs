@@ -547,7 +547,7 @@ fn derive_username(email: Option<&str>, preferred_username: Option<&str>, subjec
 }
 
 /// Minimal HTML-escape for any IdP-derived string rendered into a page.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

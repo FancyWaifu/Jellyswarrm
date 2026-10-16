@@ -42,16 +42,13 @@ pub async fn handle_branding(
 
     let mut message = "Jellyswarrm proxying to the following servers: ".to_string();
     let custom_css = if !servers.is_empty() {
-        let server_links: Vec<String> = servers
+        // Names only: this is served to anyone before login, and backend URLs
+        // are internal addresses. jellyfin-web renders it as HTML, so escape.
+        let names: Vec<String> = servers
             .iter()
-            .map(|s| {
-                format!(
-                    "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
-                    s.url, s.name
-                )
-            })
+            .map(|s| crate::handlers::sso::esc(&s.name))
             .collect();
-        message.push_str(&server_links.join(", "));
+        message.push_str(&names.join(", "));
 
         fetch_custom_css(state.server_storage.as_ref(), &servers).await
     } else {
