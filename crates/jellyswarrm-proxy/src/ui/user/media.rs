@@ -225,11 +225,24 @@ pub async fn get_library_items(
     }
 }
 
+/// A Jellyfin item id: 32 hex digits, optionally dashed as a UUID.
+fn is_item_id(id: &str) -> bool {
+    let hex = id.replace('-', "");
+    hex.len() == 32
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
+        && (id.len() == 32 || id.len() == 36)
+}
+
 pub async fn proxy_media_image(
     State(state): State<AppState>,
     AuthenticatedUser(user): AuthenticatedUser,
     Path((server_id, item_id)): Path<(i64, String)>,
 ) -> impl IntoResponse {
+    // item_id is spliced into the backend URL path: anything but an id (e.g.
+    // "../../System/Configuration?") would reach other backend endpoints.
+    if !is_item_id(&item_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     // Get server
     let server = match state.server_storage.get_server_by_id(server_id).await {
         Ok(Some(s)) => s,
@@ -289,5 +302,25 @@ pub async fn proxy_media_image(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_item_id;
+
+    #[test]
+    fn only_item_ids_reach_the_backend_path() {
+        assert!(is_item_id("78188bc1f63e4a1a92c39dcb19736c95"));
+        assert!(is_item_id("32c40517-80ab-2454-b6a5-2f0e71c33680"));
+        for bad in [
+            "../../System/Configuration?",
+            "..%2F..%2FUsers",
+            "abc",
+            "",
+            "78188bc1f63e4a1a92c39dcb19736c9g",
+        ] {
+            assert!(!is_item_id(bad), "{bad:?}");
+        }
     }
 }
