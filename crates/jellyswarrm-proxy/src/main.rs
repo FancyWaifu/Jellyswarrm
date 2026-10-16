@@ -268,7 +268,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pragma("cache_size", "-65536")
         .pragma("mmap_size", "268435456")
         .pragma("temp_store", "MEMORY")
-        .pragma("wal_autocheckpoint", "1000");
+        .pragma("wal_autocheckpoint", "1000")
+        // Zero freed content: rewritten credentials (legacy rows re-saved at
+        // login, rotated tokens) must not linger as readable bytes in the file.
+        .pragma("secure_delete", "on");
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(16)
@@ -338,6 +341,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok((upgraded, still_legacy, tokens)) => {
             if upgraded + tokens > 0 {
                 info!("Encrypted {upgraded} legacy server mappings and {tokens} session tokens under the server key");
+                // The old plaintext/legacy bytes, and anything the old build had
+                // already deleted, still sit in free space and the WAL: rewrite
+                // the file once so they're gone.
+                for stmt in ["VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)"] {
+                    if let Err(e) = sqlx::query(stmt).execute(&pool).await {
+                        warn!("{stmt} after credential upgrade failed: {e}");
+                    }
+                }
             }
             if still_legacy > 0 {
                 warn!("{still_legacy} legacy server mappings could not be verified yet; they upgrade on the user's next successful login");
