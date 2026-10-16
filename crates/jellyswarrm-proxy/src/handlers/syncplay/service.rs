@@ -647,7 +647,7 @@ mod tests {
 
         let m1 = recv_json(&mut rx).await;
         let m2 = recv_json(&mut rx).await;
-        let messages = vec![m1, m2];
+        let messages = [m1, m2];
         assert!(messages
             .iter()
             .any(|m| m["MessageType"] == "SyncPlayCommand"
