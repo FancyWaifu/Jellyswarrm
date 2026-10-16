@@ -45,6 +45,22 @@ Each script brings up the containers it needs and tears them down. The SSO
 suites need the identity providers started and configured first; `run-all.sh sso`
 does that.
 
+## Upgrade matrix
+
+`run_migrations.py [name ...]` upgrades 26 scenarios to `bin/new`: one source
+version per schema level of the fork (February to October 2026, plus the
+abandoned `rebuild-on-upstream` branch), up to 150 users and 50,000 media ids,
+unusual names and passwords, damaged rows (corrupt or stale credentials,
+duplicate URLs, a removed server, foreign migrations, an unclean shutdown),
+config shapes (comments, key in the file, key in the environment, file lost),
+a backend offline during the upgrade, SSO links, and a multi-hop upgrade. Each
+checks the backup, that no user, SSO identity or media id is lost, sessions,
+passwords, per-user servers, web UI and SSO logins, that no plaintext secret is
+left in the database file, restart, and rollback to the old build.
+
+Build the sources first (`bin/<name>` for each entry of `S` in the script), e.g.
+`./build-macos.sh ff1de26 src-ff1de26`. It takes about two hours.
+
 ## Notes
 
 - Servers count as offline until their first health check, so a few tests wait

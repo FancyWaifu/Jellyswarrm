@@ -71,6 +71,7 @@ def jf_create_user(host, name, pw):
 
 
 def ui_login(proxy, user, pw):
+    pace()  # the UI login shares the per-client auth limiter
     b = Browser()
     st, url, body = b.go("POST", f"{proxy}/ui/login", {"username": user, "password": pw})
     return b, st, url
@@ -79,9 +80,17 @@ def ui_login(proxy, user, pw):
 _bucket = {"tokens": 5.0, "t": time.time()}
 
 
+_PACE_FILE = "/state/.auth-bucket.json"  # shared by every test process in the runner
+
+
 def pace():
     """Mirror the proxy's per-IP auth limiter (burst 5, +1 every 10 s) so tests
-    never trip it unintentionally; the limiter itself is tested separately."""
+    never trip it unintentionally; the limiter itself is tested separately.
+    The bucket is persisted so back-to-back test processes share it, like the proxy."""
+    try:
+        _bucket.update(json.load(open(_PACE_FILE)))
+    except (OSError, ValueError):
+        pass
     now = time.time()
     _bucket["tokens"] = min(5.0, _bucket["tokens"] + (now - _bucket["t"]) / 10.5)
     _bucket["t"] = now
@@ -89,6 +98,10 @@ def pace():
         time.sleep((1 - _bucket["tokens"]) * 10.5)
         _bucket["tokens"], _bucket["t"] = 1.0, time.time()
     _bucket["tokens"] -= 1
+    try:
+        json.dump(_bucket, open(_PACE_FILE, "w"))
+    except OSError:
+        pass
 
 
 def api_login(proxy, user, pw, dev="e2e-dev"):
