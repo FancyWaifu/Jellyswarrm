@@ -115,6 +115,9 @@ impl ServerStorageService {
             "Added server: {} ({}) with priority {}",
             name, url, priority
         );
+        // Unchecked servers count as offline; check now rather than leaving the
+        // new server out of every request until the next loop iteration.
+        self.check_servers_health().await;
         Ok(server_id)
     }
 
@@ -250,13 +253,16 @@ impl ServerStorageService {
         Ok(result.rows_affected() > 0)
     }
 
-    pub fn start_health_check_loop(&self, wait_time_secs: u64) {
+    /// Runs the first check before returning, so servers aren't treated as
+    /// offline while the proxy starts serving.
+    pub async fn start_health_check_loop(&self, wait_time_secs: u64) {
+        self.check_servers_health().await;
         let service = self.clone();
         tokio::spawn(async move {
             info!("Starting server health check loop");
             loop {
-                service.check_servers_health().await;
                 tokio::time::sleep(tokio::time::Duration::from_secs(wait_time_secs)).await;
+                service.check_servers_health().await;
             }
         });
     }

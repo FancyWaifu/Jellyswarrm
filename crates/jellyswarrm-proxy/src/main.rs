@@ -340,7 +340,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize server storage service
     let server_storage = ServerStorageService::new(pool.clone());
-    server_storage.start_health_check_loop(loaded_config.server_background_check_interval_secs);
+    server_storage
+        .start_health_check_loop(loaded_config.server_background_check_interval_secs)
+        .await;
 
     // Initialize media storage service
     let media_storage = MediaStorageService::new(pool.clone());
