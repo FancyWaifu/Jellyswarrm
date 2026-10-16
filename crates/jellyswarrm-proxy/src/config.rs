@@ -443,6 +443,13 @@ fn dev_config_path() -> PathBuf {
     DATA_DIR.join(DEV_CONFIG_FILENAME)
 }
 
+/// `JELLYSWARRM_<KEY>` environment variables. Keys aren't nested, so names are
+/// not split on `_`: `JELLYSWARRM_SESSION_KEY` is `session_key` (splitting made it
+/// `session.key`, silently ignoring every documented multi-word variable).
+fn env_source() -> config::Environment {
+    config::Environment::with_prefix("JELLYSWARRM")
+}
+
 /// Load configuration from known files and environment.
 ///
 /// Errors instead of falling back to defaults: `session_key` encrypts stored
@@ -468,11 +475,11 @@ pub fn load_config_with_session_key(existing_key: Option<&[u8]>) -> anyhow::Resu
                 config::File::with_name(dev_config_path().to_string_lossy().as_ref())
                     .required(false),
             )
-            .add_source(config::Environment::with_prefix("JELLYSWARRM").separator("_"))
+            .add_source(env_source())
     } else {
         config::Config::builder()
             .add_source(config::File::with_name(path.to_string_lossy().as_ref()).required(false))
-            .add_source(config::Environment::with_prefix("JELLYSWARRM").separator("_"))
+            .add_source(env_source())
     };
 
     let source = builder.build()?;
@@ -616,6 +623,35 @@ impl<'de> serde::Deserialize<'de> for UrlSegment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_word_env_vars_reach_their_keys() {
+        let env: config::Map<String, String> = [
+            ("JELLYSWARRM_SESSION_KEY", BASE64_STANDARD.encode([3u8; 64])),
+            ("JELLYSWARRM_URL_PREFIX", "jelly".to_string()),
+            (
+                "JELLYSWARRM_SERVER_BACKGROUND_CHECK_INTERVAL_SECS",
+                "45".to_string(),
+            ),
+            ("JELLYSWARRM_PASSWORD", "from-env".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let source = config::Config::builder()
+            .add_source(env_source().source(Some(env)))
+            .build()
+            .unwrap();
+        assert!(source.get_string("session_key").is_ok());
+        let cfg: AppConfig = source.try_deserialize().unwrap();
+        assert_eq!(cfg.session_key, vec![3u8; 64]);
+        assert_eq!(
+            cfg.url_prefix.map(|p| p.to_string()),
+            Some("jelly".to_string())
+        );
+        assert_eq!(cfg.server_background_check_interval_secs, 45);
+        assert_eq!(cfg.password.as_str(), "from-env");
+    }
+
     #[test]
     fn session_key_line_keeps_the_file_and_parses() {
         let original = "# my comment\nusername = \"admin\"\n\n[[preconfigured_servers]]\nurl = \"http://a\"\nname = \"A\"\n";
