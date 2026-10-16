@@ -153,7 +153,8 @@ async fn get_items_from_all_servers_inner(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let server_priorities: Vec<i32> = targets.iter().map(|(_, s, _)| s.priority).collect();
-    let page = Page::from_url(original_request.url());
+    let mut page = Page::from_url(original_request.url());
+    page.split_across(server_priorities.len());
 
     let mut join_set = JoinSet::new();
 
@@ -888,14 +889,22 @@ fn dedup_children_by_number(
 /// `StartIndex + Limit` items (in the client's sort), merge them, sort the union
 /// the same way, then cut the client's window. Every item that belongs in the
 /// window is in some backend's first `StartIndex + Limit`.
-/// ponytail: deep pages refetch everything before them (O(StartIndex) per page);
-/// a per-backend cursor cache would fix that if huge libraries get slow.
+/// Deep pages refetch everything before them, so past `MAX_MERGED_WINDOW`
+/// each backend instead pages its own share (see `split_across`).
 struct Page {
     start: usize,
     limit: Option<usize>,
     /// `None`: keep the backends' interleaved order.
     sort: Option<Vec<(String, bool)>>,
+    /// Past the window: each backend's own `(StartIndex, Limit)`.
+    per_backend: Option<(usize, Option<usize>)>,
 }
+
+/// Largest `StartIndex + Limit` merged exactly. Beyond it a request would make
+/// every backend return that many items (a cheap way to load the servers).
+/// ponytail: past it, ordering is approximate (equal share per backend); a
+/// per-backend cursor cache would make deep pages exact and cheap.
+const MAX_MERGED_WINDOW: usize = 10_000;
 
 /// Sort fields we can reproduce from item JSON. Anything else (Random,
 /// DateLastContentAdded, …) keeps the backends' own order.
@@ -968,7 +977,23 @@ impl Page {
                 .map(|(i, f)| (f, orders.get(i).copied().unwrap_or(default_desc)))
                 .collect()
         });
-        Page { start, limit, sort }
+        Page {
+            start,
+            limit,
+            sort,
+            per_backend: None,
+        }
+    }
+
+    /// Past `MAX_MERGED_WINDOW`, give each of `backends` an equal slice at its
+    /// own proportional offset instead of fetching everything before the page.
+    fn split_across(&mut self, backends: usize) {
+        if backends > 0 && self.start.saturating_add(self.limit.unwrap_or(0)) > MAX_MERGED_WINDOW {
+            self.per_backend = Some((
+                self.start / backends,
+                self.limit.map(|l| l.div_ceil(backends)),
+            ));
+        }
     }
 
     /// Backend asks for `[0, start + limit)` and returns the fields we sort on.
@@ -991,8 +1016,18 @@ impl Page {
             })
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        if let Some(l) = self.limit {
-            pairs.push(("Limit".into(), self.start.saturating_add(l).to_string()));
+        match self.per_backend {
+            Some((start, limit)) => {
+                pairs.push(("StartIndex".into(), start.to_string()));
+                if let Some(l) = limit {
+                    pairs.push(("Limit".into(), l.to_string()));
+                }
+            }
+            None => {
+                if let Some(l) = self.limit {
+                    pairs.push(("Limit".into(), self.start.saturating_add(l).to_string()));
+                }
+            }
         }
         url.query_pairs_mut().clear().extend_pairs(pairs.iter());
         *req.url_mut() = url;
@@ -1026,7 +1061,11 @@ impl Page {
         }
         items
             .into_iter()
-            .skip(self.start)
+            .skip(if self.per_backend.is_some() {
+                0
+            } else {
+                self.start
+            })
             .take(self.limit.unwrap_or(usize::MAX))
             .collect()
     }
@@ -1607,6 +1646,42 @@ mod dedup_tests {
         ];
         let ids: Vec<String> = page.apply(items).into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["c", "d1"]);
+    }
+
+    #[test]
+    fn deep_pages_are_split_across_backends() {
+        let query = |page: &Page| {
+            let mut req = reqwest::Request::new(
+                reqwest::Method::GET,
+                url::Url::parse("http://x/Items?SortBy=SortName").unwrap(),
+            );
+            page.prepare_backend_request(&mut req);
+            req.url()
+                .query_pairs()
+                .into_owned()
+                .collect::<Vec<(String, String)>>()
+        };
+        // Inside the window: every backend returns [0, start + limit).
+        let mut near =
+            Page::from_url(&url::Url::parse("http://x/Items?StartIndex=9000&Limit=100").unwrap());
+        near.split_across(2);
+        assert!(query(&near).contains(&("Limit".into(), "9100".into())));
+        // Past it: each backend pages its own share; nothing near StartIndex is fetched.
+        let mut deep = Page::from_url(
+            &url::Url::parse("http://x/Items?StartIndex=2000000000&Limit=100&SortBy=SortName")
+                .unwrap(),
+        );
+        deep.split_across(2);
+        let q = query(&deep);
+        assert!(q.contains(&("StartIndex".into(), "1000000000".into())));
+        assert!(q.contains(&("Limit".into(), "50".into())));
+        // The backends' slices are the page: sorted, not skipped again.
+        let ids: Vec<String> = deep
+            .apply(vec![named("b", "b", 1), named("a", "a", 1)])
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
     }
 
     #[test]
