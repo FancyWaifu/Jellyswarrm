@@ -7,12 +7,17 @@
 //! that backend's libraries and content. "All servers" clears the scope and
 //! returns to the merged federation.
 
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode, Uri},
+    response::IntoResponse,
+    Json,
+};
 use hyper::header;
 use serde::Serialize;
 use tracing::error;
 
-use crate::AppState;
+use crate::{request_preprocessing::resolve_request_identity_from_headers_uri, AppState};
 
 #[derive(Serialize)]
 struct ServerInfo {
@@ -20,8 +25,19 @@ struct ServerInfo {
     name: String,
 }
 
-/// `GET /servers` — the federated backends, for the switcher UI.
-pub async fn list_servers(State(state): State<AppState>) -> impl IntoResponse {
+/// `GET /servers` — the federated backends, for the switcher UI. Signed-in
+/// users only: backend names are nobody else's business.
+pub async fn list_servers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> impl IntoResponse {
+    let signed_in = resolve_request_identity_from_headers_uri(&headers, &uri, &state)
+        .await
+        .is_ok_and(|id| id.user.is_some());
+    if !signed_in {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     match state.server_storage.list_servers().await {
         Ok(servers) => Json(
             servers
@@ -94,13 +110,25 @@ const INJECT_JS: &str = r#"(function(){
     servers.forEach(function(s){row(s.name,String(s.id),cur===String(s.id));});
     cont.insertBefore(wrap,cont.firstChild);
   }
-  fetch('/servers').then(function(r){return r.ok?r.json():[];}).then(function(list){
-    servers=list||[];if(!servers.length)return;
-    build();
-    new MutationObserver(function(){
-      if(!document.getElementById('js-server-nav'))build();
-    }).observe(document.body,{childList:true,subtree:true});
-  }).catch(function(){});
+  function token(){
+    try{if(window.ApiClient&&ApiClient.accessToken()){return ApiClient.accessToken();}}catch(e){}
+    try{var c=JSON.parse(localStorage.getItem('jellyfin_credentials')||'{}');
+      return ((c.Servers||[]).filter(function(s){return s.AccessToken;})[0]||{}).AccessToken||'';}catch(e){return '';}
+  }
+  // Fetched lazily once the drawer exists, so it also works right after login.
+  var loading=false;
+  function load(){
+    var t=token();
+    if(loading||!t)return;
+    loading=true;
+    fetch('/servers',{headers:{'X-Emby-Token':t}}).then(function(r){return r.ok?r.json():[];})
+      .then(function(list){servers=list||[];build();}).catch(function(){})
+      .then(function(){if(!servers.length)setTimeout(function(){loading=false;},10000);});
+  }
+  new MutationObserver(function(){
+    if(document.getElementById('js-server-nav'))return;
+    if(servers.length)build();else load();
+  }).observe(document.body,{childList:true,subtree:true});
 })();"#;
 
 /// `GET /servers/inject.js` — the switcher client script.
