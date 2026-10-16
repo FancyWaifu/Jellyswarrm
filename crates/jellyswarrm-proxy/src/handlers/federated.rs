@@ -153,6 +153,7 @@ async fn get_items_from_all_servers_inner(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let server_priorities: Vec<i32> = targets.iter().map(|(_, s, _)| s.priority).collect();
+    let page = Page::from_url(original_request.url());
 
     let mut join_set = JoinSet::new();
 
@@ -176,6 +177,7 @@ async fn get_items_from_all_servers_inner(
         if let Some(pid) = parent_lib.as_ref() {
             set_parent_id(&mut request, pid);
         }
+        page.prepare_backend_request(&mut request);
         let state_clone = state.clone();
         let server_clone = server.clone();
         let session_clone = session.clone();
@@ -290,6 +292,17 @@ async fn get_items_from_all_servers_inner(
         }
     }
 
+    // Each backend's own total, for the merged TotalRecordCount.
+    let backend_total: usize = server_items
+        .iter()
+        .map(|(_, items)| match items {
+            crate::models::ItemsResponseVariants::WithCount(w) => {
+                (w.total_record_count.max(0) as usize).max(w.items.len())
+            }
+            crate::models::ItemsResponseVariants::Bare(v) => v.len(),
+        })
+        .sum();
+
     // Interleave items from all servers with Live TV filtering. Carry each item's
     // backend priority so movie dedup can keep the highest-priority copy.
     let mut interleaved_items: Vec<(crate::models::MediaItem, i32)> = Vec::new();
@@ -321,6 +334,7 @@ async fn get_items_from_all_servers_inner(
 
     // Collapse same-type libraries across backends into one view (registering
     // the merge group for ParentId fan-out), then collapse duplicate movies.
+    let fetched = interleaved_items.len();
     let interleaved_items: Vec<crate::models::MediaItem> = if dedup_movies {
         let merged = dedup_and_register_views(&state, interleaved_items).await;
         let merged = dedup_and_register_series(&state, merged).await;
@@ -332,6 +346,12 @@ async fn get_items_from_all_servers_inner(
             .collect()
     };
 
+    // ponytail: duplicates beyond the fetched window aren't seen, so the total
+    // can overcount by those; exact needs every backend's full id list.
+    let total = backend_total
+        .saturating_sub(fetched - interleaved_items.len())
+        .max(interleaved_items.len());
+    let interleaved_items = page.apply(interleaved_items);
     let count = interleaved_items.len();
     debug!(
         "Returning {} items from {} servers (dedup_movies={})",
@@ -352,8 +372,8 @@ async fn get_items_from_all_servers_inner(
         Ok(Json(crate::models::ItemsResponseVariants::WithCount(
             crate::models::ItemsResponseWithCount {
                 items: interleaved_items,
-                total_record_count: count as i32,
-                start_index: 0,
+                total_record_count: total.min(i32::MAX as usize) as i32,
+                start_index: page.start.min(i32::MAX as usize) as i32,
             },
         )))
     } else {
@@ -366,6 +386,11 @@ async fn get_items_from_all_servers_inner(
 /// Ensure the request's `Fields` query includes `ProviderIds` — list views don't
 /// request it by default, but dedup needs it on every item.
 fn ensure_provider_ids_field(req: &mut reqwest::Request) {
+    ensure_field(req, "ProviderIds");
+}
+
+/// Ensure the request's `Fields` query includes `field`.
+fn ensure_field(req: &mut reqwest::Request, field: &str) {
     let mut url = req.url().clone();
     let mut pairs: Vec<(String, String)> = url
         .query_pairs()
@@ -375,13 +400,14 @@ fn ensure_provider_ids_field(req: &mut reqwest::Request) {
     for (k, v) in pairs.iter_mut() {
         if k.eq_ignore_ascii_case("fields") {
             had_fields = true;
-            if !v.to_lowercase().contains("providerids") {
-                v.push_str(",ProviderIds");
+            if !v.split(',').any(|f| f.trim().eq_ignore_ascii_case(field)) {
+                v.push(',');
+                v.push_str(field);
             }
         }
     }
     if !had_fields {
-        pairs.push(("Fields".to_string(), "ProviderIds".to_string()));
+        pairs.push(("Fields".to_string(), field.to_string()));
     }
     url.query_pairs_mut().clear().extend_pairs(pairs.iter());
     *req.url_mut() = url;
@@ -857,6 +883,196 @@ fn dedup_children_by_number(
     out.into_iter().map(|(it, _)| it).collect()
 }
 
+/// Client paging and sort for a federated list. Each backend pages on its own,
+/// so a merged page can't be forwarded as-is: ask every backend for its first
+/// `StartIndex + Limit` items (in the client's sort), merge them, sort the union
+/// the same way, then cut the client's window. Every item that belongs in the
+/// window is in some backend's first `StartIndex + Limit`.
+/// ponytail: deep pages refetch everything before them (O(StartIndex) per page);
+/// a per-backend cursor cache would fix that if huge libraries get slow.
+struct Page {
+    start: usize,
+    limit: Option<usize>,
+    /// `None`: keep the backends' interleaved order.
+    sort: Option<Vec<(String, bool)>>,
+}
+
+/// Sort fields we can reproduce from item JSON. Anything else (Random,
+/// DateLastContentAdded, …) keeps the backends' own order.
+const SORTABLE: &[&str] = &[
+    "SortName",
+    "Name",
+    "ProductionYear",
+    "PremiereDate",
+    "DateCreated",
+    "DatePlayed",
+    "PlayCount",
+    "CommunityRating",
+    "CriticRating",
+    "OfficialRating",
+    "Runtime",
+    "Album",
+    "AlbumArtist",
+    "Artist",
+    "SeriesSortName",
+    "ParentIndexNumber",
+    "IndexNumber",
+    "IsFolder",
+    "Path",
+];
+
+impl Page {
+    fn from_url(url: &url::Url) -> Self {
+        let mut start = 0;
+        let mut limit = None;
+        let mut fields: Vec<String> = Vec::new();
+        let mut orders: Vec<bool> = Vec::new();
+        for (k, v) in url.query_pairs() {
+            if k.eq_ignore_ascii_case("StartIndex") {
+                start = v.parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("Limit") {
+                limit = v.parse().ok();
+            } else if k.eq_ignore_ascii_case("SortBy") {
+                fields.extend(
+                    v.split(',')
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty()),
+                );
+            } else if k.eq_ignore_ascii_case("SortOrder") {
+                orders.extend(
+                    v.split(',')
+                        .map(|o| o.trim().eq_ignore_ascii_case("Descending")),
+                );
+            }
+        }
+        let path = url.path().trim_end_matches('/').to_ascii_lowercase();
+        // Rows without an explicit SortBy whose backend order is by date.
+        if fields.is_empty() {
+            if path.ends_with("/latest") {
+                fields.push("DateCreated".into());
+                orders = vec![true];
+            } else if path.ends_with("/resume") {
+                fields.push("DatePlayed".into());
+                orders = vec![true];
+            }
+        }
+        let sort = (!fields.is_empty()
+            && !path.ends_with("/nextup")
+            && SORTABLE.iter().any(|s| s.eq_ignore_ascii_case(&fields[0])))
+        .then(|| {
+            let default_desc = orders.first().copied().unwrap_or(false);
+            fields
+                .into_iter()
+                .enumerate()
+                .filter(|(_, f)| SORTABLE.iter().any(|s| s.eq_ignore_ascii_case(f)))
+                .map(|(i, f)| (f, orders.get(i).copied().unwrap_or(default_desc)))
+                .collect()
+        });
+        Page { start, limit, sort }
+    }
+
+    /// Backend asks for `[0, start + limit)` and returns the fields we sort on.
+    fn prepare_backend_request(&self, req: &mut reqwest::Request) {
+        if let Some(sort) = &self.sort {
+            for (f, _) in sort {
+                if f.eq_ignore_ascii_case("SortName") || f.eq_ignore_ascii_case("DateCreated") {
+                    ensure_field(req, f);
+                }
+            }
+        }
+        if self.start == 0 && self.limit.is_none() {
+            return;
+        }
+        let mut url = req.url().clone();
+        let mut pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| {
+                !k.eq_ignore_ascii_case("StartIndex") && !k.eq_ignore_ascii_case("Limit")
+            })
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        if let Some(l) = self.limit {
+            pairs.push(("Limit".into(), self.start.saturating_add(l).to_string()));
+        }
+        url.query_pairs_mut().clear().extend_pairs(pairs.iter());
+        *req.url_mut() = url;
+    }
+
+    fn apply(&self, mut items: Vec<crate::models::MediaItem>) -> Vec<crate::models::MediaItem> {
+        if let Some(sort) = &self.sort {
+            let mut keyed: Vec<(Vec<serde_json::Value>, crate::models::MediaItem)> = items
+                .into_iter()
+                .map(|it| {
+                    let v = serde_json::to_value(&it).unwrap_or_default();
+                    (sort.iter().map(|(f, _)| sort_value(&v, f)).collect(), it)
+                })
+                .collect();
+            // Stable: ties keep the interleaved order.
+            keyed.sort_by(|(a, _), (b, _)| {
+                sort.iter()
+                    .zip(a.iter().zip(b))
+                    .map(|((_, desc), (x, y))| {
+                        let o = cmp_json(x, y);
+                        if *desc {
+                            o.reverse()
+                        } else {
+                            o
+                        }
+                    })
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            items = keyed.into_iter().map(|(_, it)| it).collect();
+        }
+        items
+            .into_iter()
+            .skip(self.start)
+            .take(self.limit.unwrap_or(usize::MAX))
+            .collect()
+    }
+}
+
+/// The JSON value an item sorts by for a Jellyfin `SortBy` field.
+fn sort_value(item: &serde_json::Value, field: &str) -> serde_json::Value {
+    let get = |v: &serde_json::Value, k: &str| -> serde_json::Value {
+        v.as_object()
+            .and_then(|o| o.iter().find(|(key, _)| key.eq_ignore_ascii_case(k)))
+            .map(|(_, v)| v.clone())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let user_data = || get(item, "UserData");
+    match field.to_ascii_lowercase().as_str() {
+        "sortname" => match get(item, "SortName") {
+            serde_json::Value::Null => get(item, "Name"),
+            v => v,
+        },
+        "runtime" => get(item, "RunTimeTicks"),
+        "dateplayed" => get(&user_data(), "LastPlayedDate"),
+        "playcount" => get(&user_data(), "PlayCount"),
+        "artist" => get(item, "Artists").get(0).cloned().unwrap_or_default(),
+        _ => get(item, field),
+    }
+}
+
+/// Order like Jellyfin: missing values first, numbers numerically, text
+/// case-insensitively (ISO dates sort correctly as text).
+fn cmp_json(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    use serde_json::Value::*;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Null, Null) => Ordering::Equal,
+        (Null, _) => Ordering::Less,
+        (_, Null) => Ordering::Greater,
+        (Number(x), Number(y)) => x
+            .as_f64()
+            .partial_cmp(&y.as_f64())
+            .unwrap_or(Ordering::Equal),
+        (Bool(x), Bool(y)) => x.cmp(y),
+        (String(x), String(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        _ => Ordering::Equal,
+    }
+}
+
 /// Replace (or add) the `ParentId` query param on a backend request.
 fn set_parent_id(req: &mut reqwest::Request, parent_id: &str) {
     let mut url = req.url().clone();
@@ -1216,6 +1432,77 @@ pub async fn debug_explain(
 mod dedup_tests {
     use super::*;
     use crate::models::MediaItem;
+
+    fn named(id: &str, sort_name: &str, year: i64) -> MediaItem {
+        serde_json::from_value(serde_json::json!({
+            "Id": id, "Type": "Movie", "SortName": sort_name, "ProductionYear": year,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn page_merges_backends_then_cuts_the_client_window() {
+        let url = url::Url::parse(
+            "http://x/Items?StartIndex=2&Limit=2&SortBy=SortName,ProductionYear&SortOrder=Ascending",
+        )
+        .unwrap();
+        let page = Page::from_url(&url);
+        // Backends are asked for their first StartIndex + Limit items.
+        let mut req = reqwest::Request::new(reqwest::Method::GET, url.clone());
+        page.prepare_backend_request(&mut req);
+        let q: Vec<(String, String)> = req.url().query_pairs().into_owned().collect();
+        assert!(q.contains(&("Limit".into(), "4".into())));
+        assert!(!q.iter().any(|(k, _)| k == "StartIndex"));
+        assert!(q.contains(&("Fields".into(), "SortName".into())));
+        // Interleaved A/B results; global order is a, b, c, d(1990), d(2000), e.
+        let items = vec![
+            named("a", "a", 1),
+            named("c", "c", 1),
+            named("d2", "D", 2000),
+            named("b", "B", 1),
+            named("d1", "d", 1990),
+            named("e", "e", 1),
+        ];
+        let ids: Vec<String> = page.apply(items).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["c", "d1"]);
+    }
+
+    #[test]
+    fn page_keeps_backend_order_for_unknown_sorts_and_sorts_resume_by_date() {
+        let random =
+            Page::from_url(&url::Url::parse("http://x/Items?SortBy=Random&Limit=2").unwrap());
+        let ids: Vec<String> = random
+            .apply(vec![
+                named("z", "z", 1),
+                named("a", "a", 1),
+                named("m", "m", 1),
+            ])
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["z", "a"]);
+
+        let resume =
+            Page::from_url(&url::Url::parse("http://x/UserItems/Resume?Limit=12").unwrap());
+        let played = |id: &str, when: &str| -> MediaItem {
+            serde_json::from_value(serde_json::json!({
+                "Id": id, "Type": "Movie", "UserData": {
+                    "PlaybackPositionTicks": 1, "PlayCount": 0, "IsFavorite": false,
+                    "Played": false, "Key": id, "ItemId": id, "LastPlayedDate": when,
+                },
+            }))
+            .unwrap()
+        };
+        let ids: Vec<String> = resume
+            .apply(vec![
+                played("old", "2026-01-01T00:00:00.0000000Z"),
+                played("new", "2026-03-01T00:00:00.0000000Z"),
+            ])
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["new", "old"]);
+    }
 
     #[test]
     fn strip_server_suffix_cases() {
