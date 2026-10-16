@@ -495,11 +495,28 @@ pub fn load_config_with_session_key(existing_key: Option<&[u8]>) -> anyhow::Resu
 
     // A freshly generated key must be on disk before anything is encrypted
     // with it, or the next restart generates another one.
-    if !path.exists() || !had_session_key {
+    if !path.exists() {
         save_config(&config)?;
+    } else if !had_session_key {
+        // Add just the key: re-serializing would drop the user's comments and
+        // layout (and write env-provided values into the file).
+        let original = fs::read_to_string(&path)?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, with_session_key_line(&original, &config.session_key))?;
+        fs::rename(&tmp, &path)?;
+        info!("Saved generated session_key to {path:?}");
     }
 
     Ok(config)
+}
+
+/// `original` with a top-level `session_key` line in front (top-level keys must
+/// come before any `[table]`).
+fn with_session_key_line(original: &str, key: &[u8]) -> String {
+    format!(
+        "# Encrypts stored backend credentials. Back it up; never change it.\nsession_key = \"{}\"\n\n{original}",
+        BASE64_STANDARD.encode(key)
+    )
 }
 
 /// Persist configuration to the first existing file or the primary default file.
@@ -599,6 +616,23 @@ impl<'de> serde::Deserialize<'de> for UrlSegment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_key_line_keeps_the_file_and_parses() {
+        let original = "# my comment\nusername = \"admin\"\n\n[[preconfigured_servers]]\nurl = \"http://a\"\nname = \"A\"\n";
+        let key = vec![7u8; 64];
+        let out = with_session_key_line(original, &key);
+        assert!(out.ends_with(original));
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["session_key"].as_str().unwrap(),
+            BASE64_STANDARD.encode(&key)
+        );
+        assert_eq!(
+            parsed["preconfigured_servers"][0]["name"].as_str(),
+            Some("A")
+        );
+    }
+
     use super::*;
 
     #[test]
