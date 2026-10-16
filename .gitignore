@@ -30,3 +30,6 @@ target
 /target
 
 /logs
+
+# macOS Finder metadata
+.DS_Store
