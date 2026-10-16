@@ -317,6 +317,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub url_prefix: Option<UrlSegment>,
 
+    /// Public base URL clients use, e.g. `https://jelly.example.com`. When set,
+    /// SSO redirect URIs are built from it instead of the request's Host header.
+    #[serde(default)]
+    pub public_url: Option<String>,
+
     #[serde(
         default = "default_media_streaming_mode",
         deserialize_with = "deserialize_media_streaming_mode"
@@ -412,6 +417,7 @@ impl fmt::Debug for AppConfig {
             .field("timeout", &self.timeout)
             .field("ui_route", &self.ui_route)
             .field("url_prefix", &self.url_prefix)
+            .field("public_url", &self.public_url)
             .field("media_streaming_mode", &self.media_streaming_mode)
             .field(
                 "server_background_check_interval_secs",

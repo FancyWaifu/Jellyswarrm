@@ -48,10 +48,23 @@ async fn decrypt_secret(state: &AppState, provider: &OidcProvider) -> Result<Str
         .map_err(|e| internal(format!("client secret decrypt failed: {e}")))
 }
 
-/// Build the `redirect_uri` from the inbound request. It must match a value
-/// registered with the IdP exactly, so we derive it from the Host the browser
-/// actually used (+ any configured url_prefix).
+/// Build the `redirect_uri`. It must match a value registered with the IdP
+/// exactly. With `public_url` set it is fixed; otherwise it is derived from the
+/// Host the browser used (+ any configured url_prefix), which a client can
+/// influence, so set `public_url` when exposed to the internet.
 async fn build_redirect_uri(state: &AppState, headers: &HeaderMap) -> String {
+    let (public_url, prefix) = {
+        let config = state.config.read().await;
+        let prefix = config
+            .url_prefix
+            .as_ref()
+            .map(|p| format!("/{p}"))
+            .unwrap_or_default();
+        (config.public_url.clone(), prefix)
+    };
+    if let Some(base) = public_url {
+        return format!("{}{prefix}/sso/callback", base.trim_end_matches('/'));
+    }
     let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
@@ -60,14 +73,6 @@ async fn build_redirect_uri(state: &AppState, headers: &HeaderMap) -> String {
         .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("http");
-    let prefix = {
-        let config = state.config.read().await;
-        config
-            .url_prefix
-            .as_ref()
-            .map(|p| format!("/{p}"))
-            .unwrap_or_default()
-    };
     format!("{scheme}://{host}{prefix}/sso/callback")
 }
 

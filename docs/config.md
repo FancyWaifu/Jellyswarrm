@@ -33,6 +33,7 @@ The table below lists all available configuration options:
 | `preconfigured_servers` | `[]` | `JELLYSWARRM_PRECONFIGURED_SERVERS` | Optional list of preconfigured Jellyfin servers (`url`, `name`, `priority`, `media_streaming_mode`). |
 | `ui_route` | `ui` | `JELLYSWARRM_UI_ROUTE` | URL path segment for accessing the web UI (e.g., `/ui`). |
 | `url_prefix` | *(none)* | `JELLYSWARRM_URL_PREFIX` | Optional URL prefix for all routes (useful for reverse proxy setups). |
+| `public_url` | *(none)* | — (set in the TOML file) | Public base URL, e.g. `https://jelly.example.com`. SSO redirect URIs are built from it instead of the request's `Host` header. Recommended when exposed to the internet. |
 | `server_background_check_interval_secs` | `30` | `JELLYSWARRM_SERVER_BACKGROUND_CHECK_INTERVAL_SECS` | Interval in seconds for background server health checks. |
 | `auto_create_users_on_login` | `true` | `JELLYSWARRM_AUTO_CREATE_USERS_ON_LOGIN` | Automatically create local users on successful upstream login. |
 | `trusted_proxies` | `[]` | — (set in the TOML file) | IPs of reverse proxies whose `X-Forwarded-For` is trusted for per-IP login rate limiting, e.g. `["172.18.0.2"]`. Leave empty when clients connect directly; behind an unlisted proxy all clients share one rate-limit bucket. |

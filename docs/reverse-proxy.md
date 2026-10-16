@@ -5,10 +5,12 @@ both sit behind a reverse proxy, a tunnel, or Cloudflare.
 
 ## Jellyswarrm behind a proxy
 
-* **Forward the original host and scheme.** The SSO callback URL is built from
-  the request's `Host` and `X-Forwarded-Proto` headers. If the proxy doesn't
-  pass `X-Forwarded-Proto: https`, the callback becomes `http://…/sso/callback`
-  and the IdP rejects it as an unregistered redirect URI.
+* **Set `public_url`** to the address users type, e.g.
+  `public_url = "https://jelly.example.com"`. The SSO callback URL is then
+  built from it. Without it, the callback is built from the request's `Host`
+  and `X-Forwarded-Proto` headers, which a client can influence; and if the
+  proxy doesn't pass `X-Forwarded-Proto: https`, the callback becomes
+  `http://…/sso/callback` and the IdP rejects it as an unregistered redirect URI.
 * **`secure_cookies = true`** when users reach Jellyswarrm over HTTPS.
 * **`trusted_proxies`** — list the IP(s) of whatever connects to Jellyswarrm
   directly (nginx, Traefik, the cloudflared container). Without it, every user
@@ -20,6 +22,7 @@ both sit behind a reverse proxy, a tunnel, or Cloudflare.
   the trusted proxy comes through Cloudflare; otherwise clients can forge it.
 
 ```toml
+public_url = "https://jelly.example.com"
 secure_cookies = true
 trusted_proxies = ["172.18.0.5"]   # e.g. the cloudflared container
 trust_cf_connecting_ip = true
