@@ -716,6 +716,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/UserViews",
                 get(handlers::federated::get_items_from_all_servers),
             )
+            .route("/Genres", get(union_or_proxy))
             // Newer Jellyfin SDKs (e.g. jellyfin-sdk-kotlin, used by the Android TV
             // client) request Continue Watching from /UserItems/Resume instead of the
             // legacy /Users/{userId}/Items/Resume. Federate it the same way so resume
@@ -749,12 +750,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         get(handlers::federated::get_items_from_all_servers_if_not_restricted),
                     )
                     // Before `/{item_id}`, which would take "Filters" for an item id
-                    // (-> 502). A merged library's id is its canonical member's
-                    // virtual id, so the plain proxy routes it to that backend.
-                    // ponytail: filters come from that one backend; a union across
-                    // members needs per-backend genre ids remapped.
-                    .route("/Filters", get(proxy_handler))
-                    .route("/Filters2", get(proxy_handler))
+                    // (-> 502). Merged libraries combine every member's values.
+                    .route("/Filters", get(union_or_proxy))
+                    .route("/Filters2", get(union_or_proxy))
                     .route("/{item_id}", get(handlers::items::get_item))
                     .route("/{item_id}/Similar", get(handlers::items::get_items))
                     .route("/{item_id}/LocalTrailers", get(handlers::items::get_items))
@@ -988,6 +986,20 @@ async fn index_handler(
             error!("index.html not found in static assets");
             Err(StatusCode::NOT_FOUND)
         }
+    }
+}
+
+/// Name lists (filter values, genres) for a merged library combine all of its
+/// member libraries; anything else goes to the owning backend as usual.
+async fn union_or_proxy(
+    State(state): State<AppState>,
+    req: Request,
+) -> Result<Response<Body>, StatusCode> {
+    match handlers::federated::merged_parent_members(&state, &req) {
+        Some(members) => handlers::federated::union_name_lists(state, req, members)
+            .await
+            .map(axum::response::IntoResponse::into_response),
+        None => proxy_handler(State(state), req).await,
     }
 }
 

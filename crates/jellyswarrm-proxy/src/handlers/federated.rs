@@ -1073,6 +1073,148 @@ fn cmp_json(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering 
     }
 }
 
+/// The member libraries behind a merged `ParentId`, unless the client is
+/// scoped to one server.
+pub fn merged_parent_members(state: &AppState, req: &Request) -> Option<Vec<(i64, String)>> {
+    if scope_server_id(req).is_some() {
+        return None;
+    }
+    let members = state
+        .view_merge
+        .members(&parent_id_from_query(req.uri().query()?)?)?;
+    (members.len() > 1).then_some(members)
+}
+
+/// `/Items/Filters`, `/Items/Filters2` and `/Genres` for a merged library: ask
+/// every member library and combine the lists by name. Genre ids are derived
+/// from the genre name, so the same genre has the same id on every backend and
+/// filtering by it already works across them.
+pub async fn union_name_lists(
+    state: AppState,
+    req: Request,
+    members: Vec<(i64, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let (original_request, _, _, sessions, _) =
+        extract_request_infos(req, &state).await.map_err(|e| {
+            error!("name-list union preprocess: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+    let sessions = sessions.ok_or(StatusCode::UNAUTHORIZED)?;
+    // Paging applies to the combined list, not per backend.
+    let page = Page {
+        sort: None,
+        ..Page::from_url(original_request.url())
+    };
+    let mut join_set = JoinSet::new();
+    for (server_id, lib_id) in members {
+        let Some((session, server)) = sessions.iter().find(|(_, s)| s.id == server_id) else {
+            continue;
+        };
+        if state.backend_health.is_ejected(server_id).await {
+            continue;
+        }
+        let Some(mut request) = original_request.try_clone() else {
+            continue;
+        };
+        set_parent_id(&mut request, &lib_id);
+        let mut url = request.url().clone();
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| {
+                !k.eq_ignore_ascii_case("StartIndex") && !k.eq_ignore_ascii_case("Limit")
+            })
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        url.query_pairs_mut().clear().extend_pairs(pairs.iter());
+        *request.url_mut() = url;
+        let (session, server) = (session.clone(), server.clone());
+        let auth = JellyfinAuthorization::Authorization(session.to_authorization());
+        let state_c = state.clone();
+        join_set.spawn(async move {
+            apply_to_request(&mut request, &server, &Some(session), &Some(auth), &state_c).await;
+            let call = execute_json_request::<serde_json::Value>(&state_c.reqwest_client, request);
+            match tokio::time::timeout(DEFAULT_BACKEND_TIMEOUT, call).await {
+                Ok(Ok(v)) => Some((server.priority, v)),
+                _ => None,
+            }
+        });
+    }
+    let mut responses = Vec::new();
+    while let Some(r) = join_set.join_next().await {
+        if let Ok(Some(v)) = r {
+            responses.push(v);
+        }
+    }
+    if responses.is_empty() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    // Highest priority first: its copy of a shared name is the one kept.
+    responses.sort_by_key(|(priority, _)| -priority);
+    let server_id = state.config.read().await.server_id.clone();
+    let mut merged = union_lists(responses.into_iter().map(|(_, v)| v).collect());
+    if let Some(items) = merged.get_mut("Items").and_then(|v| v.as_array_mut()) {
+        for item in items.iter_mut() {
+            item["ServerId"] = serde_json::Value::String(server_id.clone());
+        }
+        let total = items.len();
+        let window: Vec<serde_json::Value> = std::mem::take(items)
+            .into_iter()
+            .skip(page.start)
+            .take(page.limit.unwrap_or(usize::MAX))
+            .collect();
+        *items = window;
+        merged["TotalRecordCount"] = total.into();
+        merged["StartIndex"] = page.start.into();
+    }
+    Ok(Json(merged))
+}
+
+/// Combine JSON objects key by key: every array becomes the union of that
+/// array across responses (objects matched on `Name`, case-insensitively),
+/// sorted. Other values come from the first response.
+fn union_lists(responses: Vec<serde_json::Value>) -> serde_json::Value {
+    use std::collections::HashSet;
+    let key = |v: &serde_json::Value| -> String {
+        match v {
+            serde_json::Value::String(s) => s.to_lowercase(),
+            serde_json::Value::Object(o) => o
+                .get("Name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_lowercase(),
+            other => other.to_string(),
+        }
+    };
+    let mut iter = responses.into_iter();
+    let Some(mut out) = iter.next() else {
+        return serde_json::Value::Null;
+    };
+    let rest: Vec<serde_json::Value> = iter.collect();
+    if let Some(obj) = out.as_object_mut() {
+        for (k, v) in obj.iter_mut() {
+            let Some(list) = v.as_array_mut() else {
+                continue;
+            };
+            let mut seen: HashSet<String> = list.iter().map(key).collect();
+            for other in rest
+                .iter()
+                .filter_map(|r| r.get(k).and_then(|a| a.as_array()))
+            {
+                for el in other {
+                    if seen.insert(key(el)) {
+                        list.push(el.clone());
+                    }
+                }
+            }
+            list.sort_by(|a, b| match (a.as_f64(), b.as_f64()) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                _ => key(a).cmp(&key(b)),
+            });
+        }
+    }
+    out
+}
+
 /// Replace (or add) the `ParentId` query param on a backend request.
 fn set_parent_id(req: &mut reqwest::Request, parent_id: &str) {
     let mut url = req.url().clone();
@@ -1502,6 +1644,29 @@ mod dedup_tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, vec!["new", "old"]);
+    }
+
+    #[test]
+    fn union_lists_merges_by_name_and_sorts() {
+        let a = serde_json::json!({
+            "Genres": [{"Name": "Comedy", "Id": "c"}, {"Name": "Drama", "Id": "d"}],
+            "Years": [2001, 1999], "Tags": [], "OfficialRatings": ["PG"],
+        });
+        let b = serde_json::json!({
+            "Genres": [{"Name": "comedy", "Id": "c"}, {"Name": "Horror", "Id": "h"}],
+            "Years": [1999, 1980], "Tags": ["x"], "OfficialRatings": ["R"],
+        });
+        let out = union_lists(vec![a, b]);
+        let genres: Vec<&str> = out["Genres"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["Name"].as_str().unwrap())
+            .collect();
+        assert_eq!(genres, vec!["Comedy", "Drama", "Horror"]);
+        assert_eq!(out["Years"], serde_json::json!([1980, 1999, 2001]));
+        assert_eq!(out["Tags"], serde_json::json!(["x"]));
+        assert_eq!(out["OfficialRatings"], serde_json::json!(["PG", "R"]));
     }
 
     #[test]
