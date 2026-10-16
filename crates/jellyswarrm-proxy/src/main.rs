@@ -243,6 +243,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
         .init();
 
+    // The file as the user left it: load_config may rewrite it (to persist a
+    // generated session_key), and the pre-upgrade backup must hold the original.
+    let original_config = std::fs::read(DATA_DIR.join(crate::config::DEFAULT_CONFIG_FILENAME)).ok();
     let loaded_config = crate::config::load_config().unwrap_or_else(|e| {
         error!("Failed to load configuration: {:#}", e);
         std::process::exit(1);
@@ -279,6 +282,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tables remain in the DB unread; the binary only requires forward progress.
     let mut migrator = sqlx::migrate!();
     migrator.set_ignore_missing(true);
+    if let Err(e) = backup_before_migrations(&pool, &migrator, original_config.as_deref()).await {
+        error!(
+            "Pending database migrations, but the pre-upgrade backup failed ({e}). \
+             Not migrating; free disk space or back up {:?} by hand.",
+            *DATA_DIR
+        );
+        std::process::exit(1);
+    }
     migrator.run(&pool).await.unwrap_or_else(|e| {
         error!("Failed to run database migrations: {}", e);
         std::process::exit(1);
@@ -989,6 +1000,55 @@ async fn index_handler(
             Err(StatusCode::NOT_FOUND)
         }
     }
+}
+
+/// Upgrades can't be undone: migrations and the credential re-encryption
+/// change data an older binary can't read. Before applying any pending
+/// migration to an existing database, snapshot it (consistent even under WAL)
+/// and the config into `backups/pre-upgrade-<time>/`.
+/// ponytail: backups are never pruned; they only appear on upgrades.
+async fn backup_before_migrations(
+    pool: &sqlx::SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+    original_config: Option<&[u8]>,
+) -> anyhow::Result<()> {
+    // No migrations table: a brand-new database, nothing to lose.
+    let Ok(applied) =
+        sqlx::query_scalar::<_, i64>("SELECT version FROM _sqlx_migrations WHERE success = 1")
+            .fetch_all(pool)
+            .await
+    else {
+        return Ok(());
+    };
+    let pending = migrator
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration() && !applied.contains(&m.version))
+        .count();
+    if applied.is_empty() || pending == 0 {
+        return Ok(());
+    }
+    let dir = DATA_DIR.join("backups").join(format!(
+        "pre-upgrade-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let db = dir.join("jellyswarrm.db");
+    sqlx::query(&format!(
+        "VACUUM INTO '{}'",
+        db.to_string_lossy().replace('\'', "''")
+    ))
+    .execute(pool)
+    .await?;
+    if let Some(config) = original_config {
+        std::fs::write(dir.join(crate::config::DEFAULT_CONFIG_FILENAME), config)?;
+    }
+    warn!(
+        "Applying {pending} database migration(s). Backed up the database and config to {:?}; \
+         to roll back, stop Jellyswarrm, copy both files back into {:?} and delete \
+         jellyswarrm.db-wal and jellyswarrm.db-shm there.",
+        dir, *DATA_DIR
+    );
+    Ok(())
 }
 
 /// Name lists (filter values, genres) for a merged library combine all of its
