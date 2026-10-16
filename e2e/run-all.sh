@@ -1,7 +1,7 @@
 #!/bin/sh
 # run-all.sh [quick|browser|sso|all]: run suites against bin/new (and bin/old where an
 # upgrade is tested). Prints PASS/FAIL lines; exits non-zero on any failure.
-#   quick   API, hardening, startup, paging, filters, upgrade backup/rollback, CF rate limits
+#   quick   API, security, hardening, startup, paging, filters, upgrade backup/rollback, CF rate limits
 #   browser jellyfin-web in headless Chromium (small and 230-film libraries)
 #   sso     upgrade old -> new with 4 identity providers, then config failure modes
 E=$(cd "$(dirname "$0")" && pwd)
@@ -15,6 +15,7 @@ case $GROUP in quick|all)
   # bypass gets its own stack: the suites before it spend the login rate-limit budget.
   suite "$E/run.sh" new compat12.py run_tests.py
   suite "$E/run.sh" new bypass.py
+  suite "$E/run.sh" new security.py
   suite "$E/run_hardening.sh"
   suite "$E/run_startup.sh"
   suite "$E/run_paging.sh"

@@ -29,6 +29,7 @@ Images are never pulled unless `PULL_POLICY=missing`. Override any of them with
 |---|---|
 | `run.sh new compat12.py run_tests.py` | Jellyfin 12 API compatibility; earlier audit fixes |
 | `run.sh new bypass.py` | Existing users' local passwords are checked |
+| `run.sh new security.py` | Audit regressions: anonymous and cross-user access, login limits, open redirect, leaks, path traversal, deep paging |
 | `run_hardening.sh` | `/servers` needs a session; `public_url` pins the SSO redirect |
 | `run_startup.sh` | First requests after start/restart see every server |
 | `run_paging.sh` | 230-film merged library: paging, sort, Latest, Continue Watching |
