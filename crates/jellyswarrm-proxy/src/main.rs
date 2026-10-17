@@ -991,8 +991,11 @@ async fn index_handler(
         if let Some(content) = Asset::get("index.html") {
             // Inject the SSO login-button script into the served web client.
             let html = String::from_utf8_lossy(&content.data);
-            let script = "<script src=\"/sso/inject.js\" defer></script>\
-                          <script src=\"/servers/inject.js\" defer></script>";
+            let v = &*handlers::server_nav::INJECT_VERSION;
+            let script = format!(
+                "<script src=\"/sso/inject.js?v={v}\" defer></script>\
+                 <script src=\"/servers/inject.js?v={v}\" defer></script>"
+            );
             let injected = if html.contains("</body>") {
                 html.replacen("</body>", &format!("{script}</body>"), 1)
             } else {

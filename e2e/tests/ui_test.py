@@ -43,6 +43,9 @@ with sync_playwright() as pw:
         nav = user_menu()
     except Exception as e:
         nav = [f"missing: {str(e)[:80]}"]
+    js = page.request.get(f"{P}/servers/inject.js")
+    check("switcher script is versioned and never cached stale", page.locator("script[src^='/servers/inject.js?v=']").count() == 1
+          and js.headers.get("cache-control") == "no-cache", str(js.headers.get("cache-control")))
     check("server switcher is visible in the user menu and lists both backends", {"A", "B", "All servers"} <= set(nav), str(nav))
     try:
         with page.expect_navigation(timeout=60000):

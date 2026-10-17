@@ -167,13 +167,27 @@ const INJECT_JS: &str = r#"(function(){
   new MutationObserver(ensure).observe(document.body,{childList:true,subtree:true});
 })();"#;
 
+/// Content hash for the scripts' URLs in index.html, so a release that changes
+/// them gets a new URL past any copy a CDN or browser already holds.
+pub static INJECT_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (INJECT_JS, crate::handlers::sso::INJECT_JS).hash(&mut h);
+    format!("{:x}", h.finish())
+});
+
 /// `GET /servers/inject.js` — the switcher client script.
 pub async fn servers_inject_js() -> impl IntoResponse {
     (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            // Revalidate every load: CDNs (Cloudflare caches .js for hours by
+            // default) would otherwise keep serving a previous release's script.
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         INJECT_JS,
     )
 }

@@ -470,7 +470,7 @@ pub async fn list_sso_providers(State(state): State<AppState>) -> impl IntoRespo
 
 /// Injected into the served web client: adds a "Sign in with SSO" button to the
 /// login form and a provider picker.
-const INJECT_JS: &str = r#"(function(){
+pub(crate) const INJECT_JS: &str = r#"(function(){
   function get(cb){fetch('/sso/providers').then(function(r){return r.ok?r.json():[];}).then(cb).catch(function(){cb([]);});}
   var providers=null;
   function findForm(){
@@ -516,10 +516,15 @@ const INJECT_JS: &str = r#"(function(){
 
 pub async fn sso_inject_js() -> impl IntoResponse {
     (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            // Revalidate every load: CDNs (Cloudflare caches .js for hours by
+            // default) would otherwise keep serving a previous release's script.
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         INJECT_JS,
     )
 }
