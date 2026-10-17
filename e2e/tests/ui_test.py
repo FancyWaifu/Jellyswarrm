@@ -19,6 +19,8 @@ with sync_playwright() as pw:
     # Real browsers report a BCP 47 tag; the container default "en-US@posix" crashes
     # jellyfin-web 12.2 itself (Number.toLocaleString RangeError), proxy or not.
     page = browser.new_page(viewport={"width": 1280, "height": 800}, locale="en-US")
+    # Offline network: the Chromecast SDK (gstatic) would stall each page load on DNS.
+    page.route(re.compile(r"^https?://(?!proxy[:/])"), lambda r: r.abort())
     page.on("console", lambda m: m.type == "error" and errors.append((page.url.split("#")[-1][:40], m.text[:200])))
     page.on("pageerror", lambda e: errors.append((page.url.split("#")[-1][:40], "UNCAUGHT " + str(e)[:200])))
     page.on("response", lambda r: r.status >= 500 and failed.append((r.status, r.url[:120])))
@@ -33,12 +35,29 @@ with sync_playwright() as pw:
     page.wait_for_selector(".card", timeout=60000)
     page.screenshot(path=f"{SHOTS}/01-home.png")
     check("login + home page renders cards", page.locator(".card").count() > 0, f"cards={page.locator('.card').count()}")
+    def user_menu():  # jellyfin-web 12's default (modern) layout: the switcher lives in the user menu
+        page.click("button[aria-controls=app-user-menu]")
+        page.wait_for_selector("#app-user-menu [role=menuitem].js-server-item", state="visible", timeout=30000)
+        return [t.strip("▸ \u00a0") for t in page.locator("#app-user-menu [role=menuitem].js-server-item").all_inner_texts()]
     try:  # injected after login without a reload: /servers now needs the session token
-        page.wait_for_selector("#js-server-nav", state="attached", timeout=30000)
-        nav = [t.strip("▸ \u00a0") for t in page.locator("#js-server-nav a").all_text_contents()]
+        nav = user_menu()
     except Exception as e:
         nav = [f"missing: {str(e)[:80]}"]
-    check("server switcher lists both backends after login", {"A", "B", "All servers"} <= set(nav), str(nav))
+    check("server switcher is visible in the user menu and lists both backends", {"A", "B", "All servers"} <= set(nav), str(nav))
+    try:
+        with page.expect_navigation(timeout=60000):
+            page.locator("#app-user-menu [role=menuitem].js-server-item", has_text="B").first.click()
+        page.wait_for_url(re.compile(r"#/home"), timeout=60000); page.wait_for_selector(".card", timeout=60000)
+        page.wait_for_load_state("networkidle"); time.sleep(2)
+        libs = page.locator(".card").all_inner_texts()
+        check("picking a server scopes the home page to it", any("[B]" in t for t in libs) and not any("[A]" in t for t in libs), str(libs[:6]))
+        check("the picked server is marked in the menu", "▸ B" in " | ".join(page.evaluate("[...document.querySelectorAll('#app-user-menu .js-server-item')].map(e=>e.textContent)")))
+        user_menu()
+        with page.expect_navigation(timeout=60000):
+            page.locator("#app-user-menu [role=menuitem].js-server-item", has_text="All servers").click()
+        page.wait_for_url(re.compile(r"#/home"), timeout=60000); page.wait_for_selector(".card", timeout=60000)
+    except Exception as e:
+        check("picking a server scopes the home page to it", False, str(e)[:150])
 
     page.goto(f"{P}/#/movies?topParentId={lib}&collectionType=movies")
     try:

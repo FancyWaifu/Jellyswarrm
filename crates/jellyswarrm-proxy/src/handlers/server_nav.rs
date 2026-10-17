@@ -88,7 +88,19 @@ const INJECT_JS: &str = r#"(function(){
   };
   // --- nav drawer section ---
   var servers=[];
-  function pick(val){try{if(val)localStorage.setItem(KEY,val);else localStorage.removeItem(KEY);}catch(e){}location.assign('/');}
+  // jellyfin-web 12 persists its query cache in IndexedDB (idb-keyval's default
+  // store) and treats it as fresh for a minute, so drop it or the reloaded page
+  // shows the previous server's content.
+  function dropCache(done){
+    var once=function(){if(done){var d=done;done=null;d();}};
+    setTimeout(once,1500);
+    try{var r=indexedDB.open('keyval-store');
+      r.onsuccess=function(){try{var db=r.result,tx=db.transaction('keyval','readwrite');
+        tx.objectStore('keyval').delete('jellyfin-query-cache');
+        tx.oncomplete=tx.onerror=tx.onabort=function(){db.close();once();};}catch(e){once();}};
+      r.onerror=once;}catch(e){once();}
+  }
+  function pick(val){try{if(val)localStorage.setItem(KEY,val);else localStorage.removeItem(KEY);}catch(e){}dropCache(function(){location.assign('/');});}
   function build(){
     var cont=document.querySelector('.mainDrawer-scrollContainer')||document.querySelector('.mainDrawer');
     if(!cont||!servers.length)return;
@@ -122,13 +134,37 @@ const INJECT_JS: &str = r#"(function(){
     if(loading||!t)return;
     loading=true;
     fetch('/servers',{headers:{'X-Emby-Token':t}}).then(function(r){return r.ok?r.json():[];})
-      .then(function(list){servers=list||[];build();}).catch(function(){})
+      .then(function(list){servers=list||[];ensure();}).catch(function(){})
       .then(function(){if(!servers.length)setTimeout(function(){loading=false;},10000);});
   }
-  new MutationObserver(function(){
-    if(document.getElementById('js-server-nav'))return;
-    if(servers.length)build();else load();
-  }).observe(document.body,{childList:true,subtree:true});
+  // Modern layout (jellyfin-web 12's default) has no .mainDrawer: list the servers at
+  // the top of the user menu (#app-user-menu, kept mounted), which every layout has.
+  // ponytail: foreign nodes in a React-owned list; the observer re-adds them if a
+  // re-render drops them.
+  function buildMenu(){
+    var list=document.querySelector('#app-user-menu [role=menu]');
+    if(!list||!servers.length||list.querySelector('.js-server-item'))return;
+    var cur=scope(),tpl=list.querySelector('[role=menuitem]'),first=list.firstChild;
+    var cls=tpl?tpl.className.replace(/\bMui-(focusVisible|selected)\b/g,''):'';
+    function add(n){n.classList.add('js-server-item');list.insertBefore(n,first);}
+    var hd=document.createElement('li');hd.setAttribute('role','presentation');hd.textContent='Servers';
+    hd.style.cssText='list-style:none;padding:.4em 16px .2em;font-size:.75em;opacity:.6;text-transform:uppercase;letter-spacing:.05em';
+    add(hd);
+    function item(label,val,active){
+      var li=document.createElement('li');li.setAttribute('role','menuitem');li.tabIndex=-1;li.className=cls;
+      li.textContent=(active?'▸ ':'')+label;if(active)li.style.fontWeight='600';
+      li.onclick=function(e){e.preventDefault();pick(val);};add(li);
+    }
+    item('All servers','',!cur);
+    servers.forEach(function(s){item(s.name,String(s.id),cur===String(s.id));});
+    var hr=document.createElement('hr');hr.style.cssText='margin:4px 0;border:0;border-top:1px solid rgba(127,127,127,.3)';add(hr);
+  }
+  function ensure(){
+    if(!servers.length){load();return;}
+    if(!document.getElementById('js-server-nav'))build();
+    buildMenu();
+  }
+  new MutationObserver(ensure).observe(document.body,{childList:true,subtree:true});
 })();"#;
 
 /// `GET /servers/inject.js` — the switcher client script.
