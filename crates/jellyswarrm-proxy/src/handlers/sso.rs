@@ -574,7 +574,9 @@ fn login_complete_page(
             "UserId": user_id,
             "ManualAddress": "",
             "DateLastAccessed": 0_i64,
-            "LastConnectionMode": 1
+            // Manual: jellyfin-web 12 connects to the address the mode names, and
+            // only ManualAddress is filled (with the page's origin) below.
+            "LastConnectionMode": 2
         }]
     });
     let creds_json = serde_json::to_string(&creds)
@@ -584,7 +586,7 @@ fn login_complete_page(
         "<!doctype html><html><head><meta charset=utf-8><title>Signing in…</title></head>\
          <body style=\"font-family:sans-serif;text-align:center;margin-top:4rem\">\
          <p>Signing you in…</p>\
-         <script>(function(){{try{{var c={creds_json};c.Servers[0].ManualAddress=window.location.origin;c.Servers[0].DateLastAccessed=Date.now();localStorage.setItem('jellyfin_credentials',JSON.stringify(c));}}catch(e){{}}window.location.replace('/');}})();</script>\
+         <script>(function(){{try{{var c={creds_json};c.Servers[0].ManualAddress=c.Servers[0].LocalAddress=c.Servers[0].RemoteAddress=window.location.origin;c.Servers[0].DateLastAccessed=Date.now();localStorage.setItem('jellyfin_credentials',JSON.stringify(c));}}catch(e){{}}window.location.replace('/');}})();</script>\
          <noscript><a href=\"/\">Continue to Jellyfin</a></noscript>\
          </body></html>",
         creds_json = creds_json

@@ -2,7 +2,7 @@
 # run-all.sh [quick|browser|sso|all]: run suites against bin/new (and bin/old where an
 # upgrade is tested). Prints PASS/FAIL lines; exits non-zero on any failure.
 #   quick   API, security, hardening, startup, paging, filters, upgrade backup/rollback, CF rate limits
-#   browser jellyfin-web in headless Chromium (small and 230-film libraries)
+#   browser jellyfin-web in headless Chromium (small and 230-film libraries, SSO hand-off)
 #   sso     upgrade old -> new with 4 identity providers, then config failure modes
 E=$(cd "$(dirname "$0")" && pwd)
 GROUP=${1:-all}
@@ -25,7 +25,8 @@ case $GROUP in quick|all)
 esac
 case $GROUP in browser|all)
   suite "$E/run_ui.sh"
-  suite "$E/run_ui_big.sh";;
+  suite "$E/run_ui_big.sh"
+  suite "$E/run_ui_sso.sh";;
 esac
 case $GROUP in sso|all)
   dc down -v >/dev/null 2>&1
