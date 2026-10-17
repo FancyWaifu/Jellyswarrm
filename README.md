@@ -16,7 +16,7 @@
 
 Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers into one place. If you’ve got libraries spread across different locations or just want everything together, Jellyswarrm makes it easy to access all your media from a single interface.
 
-> This is a friendly fork of [LLukas22/Jellyswarrm](https://github.com/LLukas22/Jellyswarrm) that tracks upstream and adds a thin layer of homelab-flavored hardening (SQLite WAL, per-IP auth rate limiting, validation, security headers). All upstream features are present unchanged.
+> This is a friendly fork of [LLukas22/Jellyswarrm](https://github.com/LLukas22/Jellyswarrm). It keeps the upstream features and adds Single Sign-On, library merging and deduplication across servers, cross-server watch-state sync, a server switcher, encrypted credentials, safer upgrades and an end-to-end test suite. It ships the **Jellyfin 12.2 web client** and works with **Jellyfin 12.x and 10.11** backends, mixed freely.
 
 ---
 
@@ -49,14 +49,27 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 * **SyncPlay** – Watch together with your friends, with playback synced across all participants.
 * **Per-Server Streaming Mode** – Choose `Redirect` or `Proxy` independently for each backend.
 
-### 🛡️ Fork-Specific Additions
+### ➕ Fork-Specific Additions
 
-* **Single Sign-On (OIDC)** – Bring your own identity provider. A "Sign in with SSO" button on the login screen lets users pick their provider and land logged in, with self-service & admin account linking. See [Single Sign-On (SSO)](#-single-sign-on-sso).
-* **SQLite WAL + Tuning** – Concurrent reads, larger page cache, mmap I/O, performance indexes.
-* **Per-IP Auth Rate Limiter** – Caps login attempts (default: 5 / 10s) to blunt brute-force attacks.
-* **Credential Validation** – Username & password checks at the auth boundary before backend calls.
-* **Security Headers + CSP** – `frame-ancestors 'none'`, content-type sniff prevention, etc., on the management UI.
-* **In-Place Upgrade Safe** – Tolerates orphan migrations from older fork builds.
+**Browsing across servers**
+* **Merged libraries** – Same-type libraries from different servers (e.g. everyone's "Movies") appear as one library; paging, sorting, filters and genres work across the whole merged library.
+* **Deduplication** – The same movie, series or episode on several servers shows up once (matched by provider IDs). Opt-in with `dedup_movies = true`.
+* **Version picker** – For a deduplicated title, choose which server to stream it from.
+* **Merged home rows** – *Continue Watching*, *Next Up* and *Recently Added* combine every server, including for newer clients (e.g. Android TV) that use `/UserItems/Resume`.
+* **Server switcher** – Browse a single server's content on its own: open the user menu (your avatar, top right) and pick a server, or *All servers*.
+* **Cross-server watch state** – Watched marks, resume positions and favourites follow you to the same title on your other servers, with a retry queue for servers that are offline (`watched_state_sync`, on by default).
+
+**Sign-in & security**
+* **Single Sign-On (OIDC)** – Bring your own identity provider; users pick it from a "Sign in with SSO" button. See [Single Sign-On (SSO)](#-single-sign-on-sso).
+* **Encrypted credentials** – Stored server credentials and session tokens are encrypted with a generated `session_key`; local passwords are hashed with Argon2id.
+* **Rate limiting** – Per-IP limits on Jellyfin logins, the management UI login and SSO account linking, with correct client IPs behind trusted proxies or Cloudflare (`trusted_proxies`, `trust_cf_connecting_ip`).
+* **Hardened endpoints** – Login required for the server list, on-site-only redirects after login, item-id-only image proxying, security headers and CSP on the management UI.
+
+**Running it**
+* **Health checks** – `/health` and `/ready` endpoints (used by the Docker healthcheck); servers are checked before Jellyswarrm starts serving, and a slow or failing server is temporarily taken out of merged results and brought back automatically. See [health monitoring](./docs/health-monitoring.md).
+* **Safe upgrades** – Before applying database migrations, Jellyswarrm backs up the database and config to `data/backups/pre-upgrade-<time>/`, with rollback instructions in the log. See [Upgrading](#upgrading).
+* **Environment configuration** – Every config key can be set as `JELLYSWARRM_<KEY>`, including multi-word ones like `JELLYSWARRM_SESSION_KEY` and `JELLYSWARRM_PUBLIC_URL`.
+* **SQLite WAL + tuning** – Concurrent reads, larger page cache, mmap I/O, performance indexes.
 
 ### ⚠️ In Progress
 
@@ -86,7 +99,9 @@ services:
       - JELLYSWARRM_PASSWORD=jellyswarrm # ⚠️ Change this in production!
 ```
 
-> Prefer upstream's image? Use `ghcr.io/llukas22/jellyswarrm:latest` instead — you'll lose the fork-specific hardening but gain LLukas22's release cadence.
+`latest` follows `main`; each release also gets a fixed tag (`sso26`, `sso27`, …). Pin a fixed tag so a restart never upgrades you by surprise.
+
+> Prefer upstream's image? Use `ghcr.io/llukas22/jellyswarrm:latest` instead. You'll lose the fork-specific features but gain LLukas22's release cadence.
 
 Once the container is running, open:
 
@@ -97,6 +112,18 @@ Once the container is running, open:
 * **Bundled Jellyfin Web Client:** `http://[JELLYSWARRM_HOST]:[JELLYSWARRM_PORT]`
 
 For advanced configuration options, check out the [ui](./docs/ui.md) and [configuration](./docs/config.md) documentation. Running behind a reverse proxy, Cloudflare or with SSO? See [reverse proxy, HTTPS & SSO](./docs/reverse-proxy.md).
+
+### Upgrading
+
+Everything Jellyswarrm needs lives in the data directory (`/app/data`): the database and `jellyswarrm.toml`. The config holds the `session_key` that encrypts stored credentials, so **back up the whole directory, keep it together, and never lose the key**: without it, every stored server password and session has to be entered again.
+
+To upgrade, stop the container, back up the data directory, change the image tag, and start it again. Jellyswarrm makes its own backup to `data/backups/pre-upgrade-<time>/` before changing the database, and the log tells you how to roll back.
+
+The SSO client secrets are encrypted with the admin password (`JELLYSWARRM_PASSWORD`). If you change that password, re-add your SSO providers in the **SSO** tab (identities stay linked).
+
+### Kubernetes
+
+Running on Kubernetes with a Service named `jellyswarrm`? Kubernetes injects `JELLYSWARRM_PORT=tcp://…` into the pod, which Jellyswarrm reads as its own setting. Add `enableServiceLinks: false` to the pod spec to stop it.
 
 ---
 
@@ -135,7 +162,7 @@ scopes = "openid profile email"
 # server = "Movies"   # optional: bind to one backend for the per-server picker
 ```
 
-On the IdP side, set the application's **redirect URI** to `https://[JELLYSWARRM_HOST]/sso/callback`.
+On the IdP side, set the application's **redirect URI** to `https://[JELLYSWARRM_HOST]/sso/callback`. When Jellyswarrm is reachable from the internet, set `public_url` so the redirect URI can't be influenced by the request's Host header.
 
 ---
 
@@ -191,6 +218,10 @@ cargo build --release
 
 The build process is streamlined thanks to the included [`build.rs`](./crates/jellyswarrm-proxy/build.rs) script, which automatically compiles the web UI and embeds it into the final binary for a truly self-contained application.
 </details>
+
+### Tests
+
+`e2e/` holds a Docker end-to-end suite that runs on every push to `main` and on pull requests. It uses real Jellyfin 12.2 and 10.11 servers, Keycloak, Dex, Authentik and Authelia, and the bundled web client in headless Chromium (login, playback, server switcher, SSO). It also has an upgrade matrix that upgrades databases from older builds, including damaged and unusual ones. It runs on an isolated network and never needs internet access. Build and run instructions are in [`e2e/README.md`](./e2e/README.md).
 
 ## FAQ  
 
