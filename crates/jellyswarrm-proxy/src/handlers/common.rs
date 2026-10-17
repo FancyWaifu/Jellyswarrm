@@ -57,10 +57,13 @@ where
             StatusCode::UNAUTHORIZED
         })?;
 
-    let response_text = response.text().await.map_err(|e| {
-        error!("Failed to get response text: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    let body = jellyfin_api::read_limited(response, jellyfin_api::MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            error!("Failed to get response text: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+    let response_text = String::from_utf8_lossy(&body).into_owned();
 
     match serde_json::from_str::<T>(&response_text) {
         Ok(val) => Ok(val),

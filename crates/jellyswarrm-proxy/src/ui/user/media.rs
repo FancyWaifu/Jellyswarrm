@@ -288,7 +288,9 @@ pub async fn proxy_media_image(
         Ok(resp) => {
             let status = resp.status();
             let headers = resp.headers().clone();
-            let body = resp.bytes().await.unwrap_or_default();
+            let body = jellyfin_api::read_limited(resp, jellyfin_api::MAX_RESPONSE_BYTES)
+                .await
+                .unwrap_or_default();
 
             let mut response = Response::builder().status(status);
             if let Some(ct) = headers.get(header::CONTENT_TYPE) {

@@ -3,4 +3,6 @@ pub mod error;
 pub mod models;
 pub mod storage;
 
-pub use client::{ClientInfo, ItemUserData, JellyfinClient, MatchKey};
+pub use client::{
+    read_limited, ClientInfo, ItemUserData, JellyfinClient, MatchKey, MAX_RESPONSE_BYTES,
+};

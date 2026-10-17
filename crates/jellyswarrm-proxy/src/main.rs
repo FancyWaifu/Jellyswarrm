@@ -1254,10 +1254,9 @@ async fn proxy_handler(
         }
     }
     let headers = response.headers().clone();
-    let body_bytes = response.bytes().await.map_err(|e| {
-        error!("Failed to read response body: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    // Passed through unchanged, so stream it instead of holding it in memory (a
+    // large or hostile backend answer could otherwise exhaust it).
+    let body = Body::from_stream(response.bytes_stream());
 
     let mut response_builder = Response::builder().status(status);
 
@@ -1268,7 +1267,7 @@ async fn proxy_handler(
         }
     }
 
-    let response = response_builder.body(Body::from(body_bytes)).map_err(|e| {
+    let response = response_builder.body(body).map_err(|e| {
         error!("Failed to build response: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;

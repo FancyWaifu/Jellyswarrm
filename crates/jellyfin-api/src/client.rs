@@ -9,6 +9,34 @@ use tokio::sync::RwLock;
 use tracing::info;
 use url::Url;
 
+/// ponytail: the most of a backend's answer read into memory. A hostile or broken
+/// server could otherwise exhaust it; raise if a real library needs more.
+pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ERROR_TEXT: usize = 64 * 1024;
+
+/// Read a response body, refusing more than `max` bytes.
+pub async fn read_limited(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, Error> {
+    let too_big = || Error::ServerError(format!("response larger than {max} bytes"));
+    if response.content_length().is_some_and(|n| n > max as u64) {
+        return Err(too_big());
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if buf.len() + chunk.len() > max {
+            return Err(too_big());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+async fn error_text(response: reqwest::Response) -> String {
+    read_limited(response, MAX_ERROR_TEXT)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientInfo {
     pub client: String,
@@ -128,15 +156,16 @@ impl JellyfinClient {
         let status = response.status();
 
         if status.is_success() {
-            let data = response.json::<T>().await?;
-            Ok(data)
+            Ok(serde_json::from_slice(
+                &read_limited(response, MAX_RESPONSE_BYTES).await?,
+            )?)
         } else {
             match status {
                 StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
                 StatusCode::FORBIDDEN => Err(Error::Forbidden),
                 StatusCode::NOT_FOUND => Err(Error::NotFound),
                 _ => {
-                    let text = response.text().await.unwrap_or_default();
+                    let text = error_text(response).await;
                     Err(Error::ServerError(format!("{} - {}", status, text)))
                 }
             }
@@ -172,7 +201,7 @@ impl JellyfinClient {
                 StatusCode::FORBIDDEN => Err(Error::Forbidden),
                 StatusCode::NOT_FOUND => Err(Error::NotFound),
                 _ => {
-                    let text = response.text().await.unwrap_or_default();
+                    let text = error_text(response).await;
                     Err(Error::ServerError(format!("{} - {}", status, text)))
                 }
             }
@@ -587,15 +616,16 @@ impl JellyfinClient {
         let status = response.status();
 
         if status.is_success() {
-            let data = response.json::<crate::models::ItemsResponse>().await?;
-            Ok(data)
+            Ok(serde_json::from_slice(
+                &read_limited(response, MAX_RESPONSE_BYTES).await?,
+            )?)
         } else {
             match status {
                 StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
                 StatusCode::FORBIDDEN => Err(Error::Forbidden),
                 StatusCode::NOT_FOUND => Err(Error::NotFound),
                 _ => {
-                    let text = response.text().await.unwrap_or_default();
+                    let text = error_text(response).await;
                     Err(Error::ServerError(format!("{} - {}", status, text)))
                 }
             }
@@ -750,6 +780,25 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_lowercase(), v.to_string()))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn read_limited_refuses_oversized_answers() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 2048]))
+            .mount(&server)
+            .await;
+        let get = || reqwest::get(format!("{}/big", server.uri()));
+        assert!(read_limited(get().await.unwrap(), 1024).await.is_err());
+        assert_eq!(
+            read_limited(get().await.unwrap(), 4096)
+                .await
+                .unwrap()
+                .len(),
+            2048
+        );
     }
 
     #[test]

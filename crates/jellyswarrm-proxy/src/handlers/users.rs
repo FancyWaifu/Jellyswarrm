@@ -446,14 +446,17 @@ async fn authenticate_on_server(
     }
 
     // Parse response
-    let response_text = response.text().await.map_err(|e| {
-        tracing::error!(
-            "Failed to read authentication response from {}: {}",
-            server.name,
-            e
-        );
-        AuthError::NetworkError(e.to_string())
-    })?;
+    let response_text = jellyfin_api::read_limited(response, jellyfin_api::MAX_RESPONSE_BYTES)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .map_err(|e| {
+            tracing::error!(
+                "Failed to read authentication response from {}: {}",
+                server.name,
+                e
+            );
+            AuthError::NetworkError(e.to_string())
+        })?;
 
     tracing::trace!(
         "Received authentication response from {} ({} bytes)",
