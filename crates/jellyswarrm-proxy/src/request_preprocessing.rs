@@ -391,6 +391,7 @@ pub async fn apply_to_request(
     state: &AppState,
 ) {
     remove_hop_by_hop_headers(request.headers_mut());
+    strip_client_headers(request.headers_mut());
 
     // Let reqwest derive Host from the target URL, including its port. An explicit
     // Host header would otherwise survive redirects to external image hosts.
@@ -755,6 +756,44 @@ fn remove_hop_by_hop_headers(headers: &mut reqwest::header::HeaderMap) {
     }
 }
 
+/// Headers that describe the client's side of the connection and must not reach a
+/// backend: browsers attach Jellyswarrm's own session cookie (the admin UI's, when
+/// signed in) to every same-origin request, and the rest reveal users' addresses,
+/// pages and browsers. Jellyfin authenticates by token, never by cookie. The client's
+/// user agent is replaced too: backends behind Cloudflare block some of them (403).
+/// ponytail: a denylist keeps every header Jellyfin uses working; an allowlist
+/// would also catch headers nobody has thought of yet.
+fn strip_client_headers(headers: &mut reqwest::header::HeaderMap) {
+    for h in [
+        "cookie",
+        "referer",
+        "origin",
+        "forwarded",
+        "x-real-ip",
+        "true-client-ip",
+        "cdn-loop",
+        "x-js-server",
+        "x-debug-key",
+    ] {
+        headers.remove(h);
+    }
+    let prefixed: Vec<_> = headers
+        .keys()
+        .filter(|k| k.as_str().starts_with("x-forwarded-") || k.as_str().starts_with("cf-"))
+        .cloned()
+        .collect();
+    for k in prefixed {
+        headers.remove(k);
+    }
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(concat!(
+            "Jellyswarrm/",
+            env!("CARGO_PKG_VERSION")
+        )),
+    );
+}
+
 /// Try to parse the body of a reqwest::Request into serde_json::Value
 pub fn body_to_json(request: &reqwest::Request) -> Option<serde_json::Value> {
     if let Some(content_type) = request
@@ -790,6 +829,36 @@ pub fn body_to_json(request: &reqwest::Request) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_only_headers_never_reach_a_backend() {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in [
+            ("cookie", "id=admin-session"),
+            ("referer", "https://swarm.example/web/"),
+            ("origin", "https://swarm.example"),
+            ("user-agent", "Python-urllib/3.12"),
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x-forwarded-proto", "https"),
+            ("cf-connecting-ip", "203.0.113.9"),
+            ("x-js-server", "2"),
+            ("range", "bytes=0-1023"),
+            ("accept", "application/json"),
+        ] {
+            h.insert(k, v.parse().unwrap());
+        }
+        strip_client_headers(&mut h);
+        let left: Vec<_> = h.keys().map(|k| k.as_str()).collect();
+        assert!(
+            left.contains(&"range") && left.contains(&"accept"),
+            "{left:?}"
+        );
+        assert_eq!(left.len(), 3, "{left:?}");
+        assert!(h["user-agent"]
+            .to_str()
+            .unwrap()
+            .starts_with("Jellyswarrm/"));
+    }
+
     use super::*;
     use wiremock::{
         matchers::{header, method, path},

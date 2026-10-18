@@ -17,6 +17,7 @@ case $GROUP in quick|all)
   suite "$E/run.sh" new bypass.py
   suite "$E/run.sh" new security.py
   suite "$E/run_hardening.sh"
+  suite "$E/run_headers.sh"
   suite "$E/run_startup.sh"
   suite "$E/run_paging.sh"
   suite "$E/run_paging.sh" new filters.py
